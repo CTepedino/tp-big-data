@@ -10,8 +10,19 @@ from pyspark.sql import Column, DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.streaming import StreamingQuery
 
-from src.config import BRONZE, CHECKPOINTS, LANDING
+from src.config import (
+    BRONZE,
+    CHECKPOINTS,
+    LANDING,
+    SPARK_TARGET_FILES_EVENTS,
+)
+from src.spark.performance import (
+    configure_spark_performance,
+    count_parquet_files,
+    write_partitioned_parquet,
+)
 from src.schemas.bronze_streaming import (
+    LATE_CATCHUP_MAX_SEC,
     LATE_DATA_THRESHOLD_SEC,
     USAGE_EVENTS_SCHEMA,
     WATERMARK_DELAY,
@@ -36,6 +47,17 @@ def _parse_event_value() -> Column:
     )
 
 
+def _is_replay_watermark() -> bool:
+    return WATERMARK_DELAY != WATERMARK_DELAY_PRODUCTION
+
+
+def _ingest_ts_column() -> Column:
+    """Replay histórico: ingest alineado al evento; producción: wall-clock real."""
+    if _is_replay_watermark():
+        return F.col("event_ts")
+    return F.current_timestamp()
+
+
 def transform_usage_events_bronze(df: DataFrame) -> DataFrame:
     df = (
         df.withColumn("event_ts", F.to_timestamp("timestamp"))
@@ -43,7 +65,7 @@ def transform_usage_events_bronze(df: DataFrame) -> DataFrame:
         .drop("value")
         .withColumnRenamed("value_numeric", "value")
         .withColumn("source_file", _streaming_relative_source_file())
-        .withColumn("ingest_ts", F.current_timestamp())
+        .withColumn("ingest_ts", _ingest_ts_column())
         .withColumn("ingest_date", F.to_date("ingest_ts"))
         .withColumn(
             "event_latency_sec",
@@ -90,6 +112,36 @@ def start_usage_events_bronze_query(
     return writer.start(USAGE_EVENTS_BRONZE_PATH)
 
 
+def reparquet_bronze_usage_events(
+    spark: SparkSession,
+    bronze_path: str = USAGE_EVENTS_BRONZE_PATH,
+) -> dict[str, Any]:
+    """Re-layout Bronze events by usage_date + service (reparquet) for range scans."""
+    files_before = count_parquet_files(bronze_path)
+    row_count = spark.read.parquet(bronze_path).count()
+
+    optimized = (
+        spark.read.parquet(bronze_path)
+        .withColumn("usage_date", F.to_date("event_ts"))
+        .repartition(SPARK_TARGET_FILES_EVENTS, "usage_date", "service")
+    )
+    write_partitioned_parquet(
+        optimized,
+        bronze_path,
+        partition_cols=["usage_date", "service"],
+        mode="overwrite",
+    )
+
+    files_after = count_parquet_files(bronze_path)
+    return {
+        "bronze_path": bronze_path,
+        "row_count": row_count,
+        "parquet_files_before": files_before,
+        "parquet_files_after": files_after,
+        "partition_cols": ["usage_date", "service"],
+    }
+
+
 def reset_streaming_state(
     *,
     bronze_path: str = USAGE_EVENTS_BRONZE_PATH,
@@ -114,6 +166,8 @@ def run_streaming_bronze(
     query = start_usage_events_bronze_query(spark, trigger=trigger)
     query.awaitTermination()
 
+    reparquet_stats = reparquet_bronze_usage_events(spark)
+
     bronze_df = spark.read.parquet(USAGE_EVENTS_BRONZE_PATH)
     total_rows = bronze_df.count()
     distinct_event_ids = bronze_df.select("event_id").distinct().count()
@@ -125,11 +179,14 @@ def run_streaming_bronze(
         "watermark_delay": WATERMARK_DELAY,
         "watermark_delay_production": WATERMARK_DELAY_PRODUCTION,
         "late_data_threshold_sec": LATE_DATA_THRESHOLD_SEC,
+        "late_catchup_max_sec": LATE_CATCHUP_MAX_SEC,
+        "ingest_ts_mode": "event_ts" if _is_replay_watermark() else "current_timestamp",
         "written_count": total_rows,
         "distinct_event_ids": distinct_event_ids,
         "is_unique": total_rows == distinct_event_ids,
         "late_arrivals": bronze_df.filter(F.col("is_late_arrival")).count(),
         "schema_v2_rows": bronze_df.filter(F.col("schema_version") == 2).count(),
+        "reparquet": reparquet_stats,
     }
 
 
@@ -166,6 +223,7 @@ if __name__ == "__main__":
         .master("local[*]")
         .getOrCreate()
     )
+    configure_spark_performance(spark)
     spark.sparkContext.setLogLevel("WARN")
 
     result = run_streaming_bronze(spark, reset_state=True)

@@ -3,17 +3,22 @@
 from __future__ import annotations
 
 import os
-from typing import Any
+from typing import Any, Callable
 
 from pyspark.sql import Column, DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import StructType
 from pyspark.sql.window import Window
 
-from src.config import BRONZE, LANDING
+from src.config import BRONZE, LANDING, SPARK_TARGET_FILES_MASTER
+from src.spark.performance import configure_spark_performance, write_partitioned_parquet
 from src.schemas.bronze_batch import (
     BILLING_MONTHLY_SCHEMA,
     CUSTOMERS_ORGS_SCHEMA,
+    MARKETING_TOUCHES_SCHEMA,
+    NPS_SURVEYS_SCHEMA,
+    RESOURCES_SCHEMA,
+    SUPPORT_TICKETS_SCHEMA,
     USERS_SCHEMA,
 )
 
@@ -27,6 +32,10 @@ def _parse_date(column_name: str) -> Column:
     return F.to_date(F.col(column_name))
 
 
+def _parse_timestamp(column_name: str) -> Column:
+    return F.to_timestamp(F.col(column_name))
+
+
 def _parse_double(column_name: str) -> Column:
     trimmed = F.trim(F.col(column_name))
     return F.when(trimmed == "", F.lit(None)).otherwise(trimmed.cast("double"))
@@ -35,6 +44,10 @@ def _parse_double(column_name: str) -> Column:
 def _landing_relative_source_file(landing_glob: str) -> Column:
     relative_path = os.path.join("landing", os.path.basename(landing_glob))
     return F.lit(relative_path.replace("\\", "/"))
+
+
+def _identity_casts(df: DataFrame) -> DataFrame:
+    return df
 
 
 def _apply_customers_orgs_casts(df: DataFrame) -> DataFrame:
@@ -63,6 +76,34 @@ def _apply_billing_monthly_casts(df: DataFrame) -> DataFrame:
     )
 
 
+def _apply_resources_casts(df: DataFrame) -> DataFrame:
+    return df.withColumn("created_at", _parse_date("created_at"))
+
+
+def _apply_support_tickets_casts(df: DataFrame) -> DataFrame:
+    return (
+        df.withColumn("created_at", _parse_date("created_at"))
+        .withColumn("resolved_at", _parse_date("resolved_at"))
+        .withColumn("csat", _parse_double("csat"))
+        .withColumn("sla_breached", _parse_boolean("sla_breached"))
+    )
+
+
+def _apply_marketing_touches_casts(df: DataFrame) -> DataFrame:
+    return (
+        df.withColumn("timestamp", _parse_timestamp("timestamp"))
+        .withColumn("clicked", _parse_boolean("clicked"))
+        .withColumn("converted", _parse_boolean("converted"))
+    )
+
+
+def _apply_nps_surveys_casts(df: DataFrame) -> DataFrame:
+    return (
+        df.withColumn("survey_date", _parse_date("survey_date"))
+        .withColumn("nps_score", _parse_double("nps_score"))
+    )
+
+
 BATCH_BRONZE_DATASETS: list[dict[str, Any]] = [
     {
         "dataset_name": "customers_orgs",
@@ -71,7 +112,6 @@ BATCH_BRONZE_DATASETS: list[dict[str, Any]] = [
         "dedup_keys": ["org_id"],
         "bronze_path": os.path.join(BRONZE, "customers_orgs"),
         "apply_casts": _apply_customers_orgs_casts,
-        "natural_key": "org_id",
     },
     {
         "dataset_name": "users",
@@ -80,7 +120,6 @@ BATCH_BRONZE_DATASETS: list[dict[str, Any]] = [
         "dedup_keys": ["user_id"],
         "bronze_path": os.path.join(BRONZE, "users"),
         "apply_casts": _apply_users_casts,
-        "natural_key": "user_id",
     },
     {
         "dataset_name": "billing_monthly",
@@ -89,7 +128,38 @@ BATCH_BRONZE_DATASETS: list[dict[str, Any]] = [
         "dedup_keys": ["invoice_id"],
         "bronze_path": os.path.join(BRONZE, "billing_monthly"),
         "apply_casts": _apply_billing_monthly_casts,
-        "natural_key": "invoice_id",
+    },
+    {
+        "dataset_name": "resources",
+        "landing_glob": os.path.join(LANDING, "resources.csv"),
+        "schema": RESOURCES_SCHEMA,
+        "dedup_keys": ["resource_id"],
+        "bronze_path": os.path.join(BRONZE, "resources"),
+        "apply_casts": _apply_resources_casts,
+    },
+    {
+        "dataset_name": "support_tickets",
+        "landing_glob": os.path.join(LANDING, "support_tickets.csv"),
+        "schema": SUPPORT_TICKETS_SCHEMA,
+        "dedup_keys": ["ticket_id"],
+        "bronze_path": os.path.join(BRONZE, "support_tickets"),
+        "apply_casts": _apply_support_tickets_casts,
+    },
+    {
+        "dataset_name": "marketing_touches",
+        "landing_glob": os.path.join(LANDING, "marketing_touches.csv"),
+        "schema": MARKETING_TOUCHES_SCHEMA,
+        "dedup_keys": ["touch_id"],
+        "bronze_path": os.path.join(BRONZE, "marketing_touches"),
+        "apply_casts": _apply_marketing_touches_casts,
+    },
+    {
+        "dataset_name": "nps_surveys",
+        "landing_glob": os.path.join(LANDING, "nps_surveys.csv"),
+        "schema": NPS_SURVEYS_SCHEMA,
+        "dedup_keys": ["org_id", "survey_date"],
+        "bronze_path": os.path.join(BRONZE, "nps_surveys"),
+        "apply_casts": _apply_nps_surveys_casts,
     },
 ]
 
@@ -101,7 +171,7 @@ def ingest_master_to_bronze(
     schema: StructType,
     dedup_keys: list[str],
     bronze_path: str,
-    apply_casts,
+    apply_casts: Callable[[DataFrame], DataFrame],
 ) -> dict[str, Any]:
     df = (
         spark.read.schema(schema)
@@ -129,10 +199,11 @@ def ingest_master_to_bronze(
     deduped_count = df_deduped.count()
 
     os.makedirs(bronze_path, exist_ok=True)
-    (
-        df_deduped.write.mode("overwrite")
-        .partitionBy("ingest_date")
-        .parquet(bronze_path)
+    write_partitioned_parquet(
+        df_deduped,
+        bronze_path,
+        partition_cols=["ingest_date"],
+        num_files=SPARK_TARGET_FILES_MASTER,
     )
 
     written_count = spark.read.parquet(bronze_path).count()
@@ -167,15 +238,15 @@ def run_batch_bronze(spark: SparkSession) -> list[dict[str, Any]]:
 def validate_bronze_uniqueness(spark: SparkSession) -> list[dict[str, Any]]:
     validations = []
     for dataset in BATCH_BRONZE_DATASETS:
-        natural_key = dataset["natural_key"]
+        dedup_keys = dataset["dedup_keys"]
         bronze_path = dataset["bronze_path"]
         df = spark.read.parquet(bronze_path)
         total = df.count()
-        distinct = df.select(natural_key).distinct().count()
+        distinct = df.select(*dedup_keys).distinct().count()
         validations.append(
             {
                 "dataset_name": dataset["dataset_name"],
-                "natural_key": natural_key,
+                "dedup_keys": dedup_keys,
                 "total_rows": total,
                 "distinct_keys": distinct,
                 "is_unique": total == distinct,
@@ -190,6 +261,7 @@ if __name__ == "__main__":
         .master("local[*]")
         .getOrCreate()
     )
+    configure_spark_performance(spark)
     spark.sparkContext.setLogLevel("WARN")
 
     results = run_batch_bronze(spark)
@@ -201,9 +273,10 @@ if __name__ == "__main__":
 
     for validation in validate_bronze_uniqueness(spark):
         status = "OK" if validation["is_unique"] else "FAIL"
+        keys = ",".join(validation["dedup_keys"])
         print(
-            f"{validation['dataset_name']} uniqueness [{status}]: "
-            f"{validation['distinct_keys']}/{validation['total_rows']}"
+            f"{validation['dataset_name']} uniqueness [{status}] "
+            f"({keys}): {validation['distinct_keys']}/{validation['total_rows']}"
         )
 
     spark.stop()

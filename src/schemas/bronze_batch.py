@@ -42,3 +42,49 @@ BILLING_MONTHLY_SCHEMA = StructType(
         StructField("exchange_rate_to_usd", StringType(), nullable=True),
     ]
 )
+
+RESOURCES_SCHEMA = StructType(
+    [
+        StructField("resource_id", StringType(), nullable=False),
+        StructField("org_id", StringType(), nullable=True),
+        StructField("service", StringType(), nullable=True),
+        StructField("region", StringType(), nullable=True),
+        StructField("created_at", StringType(), nullable=True),
+        StructField("state", StringType(), nullable=True),
+        StructField("tags_json", StringType(), nullable=True),
+    ]
+)
+
+SUPPORT_TICKETS_SCHEMA = StructType(
+    [
+        StructField("ticket_id", StringType(), nullable=False),
+        StructField("org_id", StringType(), nullable=True),
+        StructField("category", StringType(), nullable=True),
+        StructField("severity", StringType(), nullable=True),
+        StructField("created_at", StringType(), nullable=True),
+        StructField("resolved_at", StringType(), nullable=True),
+        StructField("csat", StringType(), nullable=True),
+        StructField("sla_breached", StringType(), nullable=True),
+    ]
+)
+
+MARKETING_TOUCHES_SCHEMA = StructType(
+    [
+        StructField("touch_id", StringType(), nullable=False),
+        StructField("org_id", StringType(), nullable=True),
+        StructField("campaign", StringType(), nullable=True),
+        StructField("channel", StringType(), nullable=True),
+        StructField("timestamp", StringType(), nullable=True),
+        StructField("clicked", StringType(), nullable=True),
+        StructField("converted", StringType(), nullable=True),
+    ]
+)
+
+NPS_SURVEYS_SCHEMA = StructType(
+    [
+        StructField("org_id", StringType(), nullable=False),
+        StructField("survey_date", StringType(), nullable=True),
+        StructField("nps_score", StringType(), nullable=True),
+        StructField("comment", StringType(), nullable=True),
+    ]
+)

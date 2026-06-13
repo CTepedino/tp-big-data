@@ -46,3 +46,8 @@ ASTRA_DB_APPLICATION_TOKEN = os.environ.get("ASTRA_DB_APPLICATION_TOKEN", "")
 ASTRA_DB_SECURE_BUNDLE_PATH = os.environ.get("ASTRA_DB_SECURE_BUNDLE_PATH", "")
 
 CQL_DIR = str(Path(__file__).resolve().parent.parent / "cql")
+
+SPARK_SHUFFLE_PARTITIONS = int(os.environ.get("SPARK_SHUFFLE_PARTITIONS", "16"))
+SPARK_TARGET_FILES_MASTER = int(os.environ.get("SPARK_TARGET_FILES_MASTER", "1"))
+SPARK_TARGET_FILES_EVENTS = int(os.environ.get("SPARK_TARGET_FILES_EVENTS", "8"))
+SPARK_TARGET_FILES_GOLD = int(os.environ.get("SPARK_TARGET_FILES_GOLD", "4"))

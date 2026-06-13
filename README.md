@@ -8,9 +8,9 @@ Landing → Bronze → Silver → Gold → Serving (AstraDB)
 
 | Camino | Fuente | Salida |
 |---|---|---|
-| Batch | `customers_orgs`, `users`, `billing_monthly` (CSV) | `datalake/bronze/` |
+| Batch | `customers_orgs`, `users`, `billing_monthly`, `resources`, `support_tickets`, `marketing_touches`, `nps_surveys` (CSV) | `datalake/bronze/` |
 | Streaming | `usage_events_stream/*.jsonl` | `datalake/bronze/usage_events/` |
-| Serving | mart Gold `org_daily_usage_by_service` | AstraDB |
+| Serving | 5 marts Gold → 5 tablas AstraDB |
 
 ---
 
@@ -55,6 +55,13 @@ cp .env.example .env   # completar credenciales Astra (se carga automáticamente
 | `ASTRA_DB_APPLICATION_TOKEN` | — | Rol **Database Administrator** |
 | `ASTRA_DB_SECURE_BUNDLE_PATH` | — | Ruta al `.zip` |
 | `STREAMING_WATERMARK` | `60 days` | Replay estático; producción: `10 minutes` |
+| `LATE_DATA_THRESHOLD_SEC` | `600` | Flag `is_late_arrival` (10 min) |
+| `LATE_CATCHUP_MAX_SEC` | `1800` | Quarantine Silver si latencia > 30 min |
+| `FUTURE_EVENT_TOLERANCE_SEC` | `300` | Quarantine Silver si `event_ts` > now + 5 min |
+| `SPARK_SHUFFLE_PARTITIONS` | `16` | Particiones de shuffle en joins/agregaciones |
+| `SPARK_TARGET_FILES_MASTER` | `1` | `coalesce` al escribir maestros (Bronze/Silver) |
+| `SPARK_TARGET_FILES_EVENTS` | `8` | `repartition` en eventos y reparquet Bronze |
+| `SPARK_TARGET_FILES_GOLD` | `4` | `repartition` por columna de partición en Gold |
 
 ---
 
@@ -65,10 +72,10 @@ Ejecutar en orden (idempotente):
 ```bash
 python -m src.jobs.bronze_batch
 python -m src.jobs.bronze_streaming
-python -m src.jobs.silver_batch
-python -m src.jobs.gold_batch
+python -m src.jobs.silver
+python -m src.jobs.gold
 
-python -m src.jobs.serving_cassandra             # carga + consultas #1 y #2
+python -m src.jobs.serving_cassandra             # foreachBatch + consultas #1–#5
 python -m src.jobs.serving_cassandra --skip-load # solo consultas
 ```
 
@@ -85,19 +92,20 @@ Usar base **Serverless (non-vector)**. Crear keyspace 'cloud_analytics'. El keys
 3. **Connect** → descargar Secure Connect Bundle + generar token **Database Administrator**
 4. Completar `.env` y correr `python -m src.jobs.serving_cassandra`
 
-El job crea la tabla (`cql/00_create_tables.cql`), carga filas Gold y ejecuta las consultas #1 y #2.
+El job crea las 5 tablas (`cql/00_create_tables.cql`), carga los marts Gold vía **Structured Streaming `foreachBatch`** y ejecuta las consultas #1 a #5.
+
+> **Carga (consigna):** Gold Parquet → `readStream.parquet` → `writeStream.foreachBatch` → prepared INSERT a Cassandra. Las consultas de demo usan `cassandra-driver`. Opcional en Spark 3.5.x: `src/cassandra/spark_connector.py` (Spark Cassandra Connector).
 
 ### Scripts CQL
 
 | Archivo | Uso |
 |---|---|
-| [`cql/00_create_tables.cql`](cql/00_create_tables.cql) | DDL (keyspace manual en consola) |
-| [`cql/01_daily_costs_and_requests.cql`](cql/01_daily_costs_and_requests.cql) | Consulta #1 — capturas en consola |
-| [`cql/02_top_services_by_cost.cql`](cql/02_top_services_by_cost.cql) | Consulta #2 — top-N se agrega en app |
-
-Los `.cql` tienen valores literales listos para CQL Console. Las queries parametrizadas del job están en `src/cassandra/queries/`.
-
-PK: `((org_id), usage_date DESC, service ASC)` — query-first, sin `ALLOW FILTERING`.
+| [`cql/00_create_tables.cql`](cql/00_create_tables.cql) | DDL de 5 tablas (keyspace manual en consola) |
+| [`cql/01_daily_costs_and_requests.cql`](cql/01_daily_costs_and_requests.cql) | Consulta #1 — costos/requests diarios |
+| [`cql/02_top_services_by_cost.cql`](cql/02_top_services_by_cost.cql) | Consulta #2 — top-N servicios (CQL puro) |
+| [`cql/03_critical_tickets_sla.cql`](cql/03_critical_tickets_sla.cql) | Consulta #3 — tickets críticos y SLA |
+| [`cql/04_monthly_revenue.cql`](cql/04_monthly_revenue.cql) | Consulta #4 — revenue mensual USD |
+| [`cql/05_genai_tokens_daily.cql`](cql/05_genai_tokens_daily.cql) | Consulta #5 — tokens GenAI por día |
 
 ### Troubleshooting
 
@@ -114,10 +122,19 @@ PK: `((org_id), usage_date DESC, service ASC)` — query-first, sin `ALLOW FILTE
 
 | Capa | Filas |
 |---|---:|
-| Bronze batch (orgs / users / billing) | 80 / 800 / 240 |
+| Bronze batch | customers_orgs / users / billing / resources / tickets / marketing / nps | 80 / 800 / 240 / 400 / 1000 / 1500 / 92 |
 | Bronze streaming (usage_events) | 43.200 |
-| Silver válidos / quarantine | 41.162 / 2.038 |
+| Silver válidos / quarantine (usage_events) | 41.162 / 2.038 |
+| Silver maestros | 7 datasets (mismos conteos que Bronze) |
 | Gold `org_daily_usage_by_service` | 12.114 |
+| Gold `revenue_by_org_month` | 240 |
+| Gold `cost_anomaly_mart` | 12.114 (6.416 con anomalía) |
+| Gold `tickets_by_org_date` | 984 |
+| Gold `genai_tokens_by_org_date` | 1.235 |
+| Gold `nps_by_org_date` | 92 (Gold-only, no Cassandra) |
+| Gold `marketing_touches_by_org_channel` | 1.477 (Gold-only, no Cassandra) |
+
+Gold-only: `cost_anomaly_mart` (consigna §4 FinOps, sin consulta CQL mínima).
 
 ---
 
@@ -125,8 +142,9 @@ PK: `((org_id), usage_date DESC, service ASC)` — query-first, sin `ALLOW FILTE
 
 - [x] Batch + streaming Bronze
 - [x] Silver (features, calidad, quarantine)
-- [x] Gold mart FinOps
-- [x] AstraDB (DDL, carga, consultas #1 y #2 en código)
-- [ ] Capturas de consultas en CQL Console
+- [x] Gold (7 marts: 5 servidos + 2 CRM + `cost_anomaly_mart` Gold-only)
+- [x] AstraDB (DDL, carga 5 tablas, consultas #1–#5 en código)
+- [x] Performance Spark (`coalesce` / `repartition` / reparquet documentado)
+- [ ] Capturas de consultas #1–#5 en CQL Console
 
-Más detalle de decisiones técnicas: [`docs/LOG_DECISIONES.md`](docs/LOG_DECISIONES.md)
+Más detalle de decisiones técnicas: [`documentation/LOG_DECISIONES.md`](documentation/LOG_DECISIONES.md)
