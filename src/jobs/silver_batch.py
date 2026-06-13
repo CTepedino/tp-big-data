@@ -1,4 +1,4 @@
-"""Job Silver: Bronze -> Silver + Quarantine."""
+"""Silver job: Bronze -> Silver + Quarantine."""
 
 from __future__ import annotations
 
@@ -27,7 +27,6 @@ def _add_quarantine_metadata(df: DataFrame, error_reason: str) -> DataFrame:
 
 
 def process_customers_orgs_silver(spark: SparkSession) -> dict[str, Any]:
-    """Conformance ligero del maestro customers_orgs."""
     df = spark.read.parquet(CUSTOMERS_ORGS_BRONZE)
 
     silver_df = (
@@ -50,20 +49,17 @@ def process_customers_orgs_silver(spark: SparkSession) -> dict[str, Any]:
         .parquet(CUSTOMERS_ORGS_SILVER)
     )
 
-    written_count = spark.read.parquet(CUSTOMERS_ORGS_SILVER).count()
-
     return {
         "dataset_name": "customers_orgs",
         "bronze_path": CUSTOMERS_ORGS_BRONZE,
         "silver_path": CUSTOMERS_ORGS_SILVER,
         "raw_count": raw_count,
         "silver_count": silver_count,
-        "written_count": written_count,
+        "written_count": spark.read.parquet(CUSTOMERS_ORGS_SILVER).count(),
     }
 
 
 def _enrich_usage_events(events_df: DataFrame, customers_df: DataFrame) -> DataFrame:
-    """Join de enriquecimiento y features de negocio."""
     customers = customers_df.select(
         "org_id",
         F.col("org_name").alias("org_name"),
@@ -94,7 +90,6 @@ def _enrich_usage_events(events_df: DataFrame, customers_df: DataFrame) -> DataF
 
 
 def _split_valid_and_quarantine(enriched_df: DataFrame) -> tuple[DataFrame, DataFrame]:
-    """Aplica las 3 reglas activas y separa válidos vs quarantine."""
     quarantine_parts: list[DataFrame] = []
 
     null_event_id = enriched_df.filter(F.col("event_id").isNull())
@@ -160,7 +155,6 @@ def _split_valid_and_quarantine(enriched_df: DataFrame) -> tuple[DataFrame, Data
 
 
 def process_usage_events_silver(spark: SparkSession) -> dict[str, Any]:
-    """Limpieza, enriquecimiento, features y quarantine de eventos."""
     events_df = spark.read.parquet(USAGE_EVENTS_BRONZE)
     customers_df = spark.read.parquet(CUSTOMERS_ORGS_SILVER)
 
@@ -170,7 +164,6 @@ def process_usage_events_silver(spark: SparkSession) -> dict[str, Any]:
 
     valid_count = valid_df.count()
     quarantine_count = quarantine_df.count()
-    cost_anomalies = valid_df.filter(F.col("is_cost_anomaly")).count()
 
     os.makedirs(USAGE_EVENTS_SILVER, exist_ok=True)
     (
@@ -186,13 +179,6 @@ def process_usage_events_silver(spark: SparkSession) -> dict[str, Any]:
             .partitionBy("ingest_date")
             .parquet(USAGE_EVENTS_QUARANTINE)
         )
-
-    written_valid = spark.read.parquet(USAGE_EVENTS_SILVER).count()
-    written_quarantine = (
-        spark.read.parquet(USAGE_EVENTS_QUARANTINE).count()
-        if quarantine_count > 0
-        else 0
-    )
 
     quarantine_sample = (
         quarantine_df.select(
@@ -212,22 +198,25 @@ def process_usage_events_silver(spark: SparkSession) -> dict[str, Any]:
         "raw_count": raw_count,
         "valid_count": valid_count,
         "quarantine_count": quarantine_count,
-        "written_valid_count": written_valid,
-        "written_quarantine_count": written_quarantine,
-        "cost_anomalies_flagged": cost_anomalies,
+        "written_valid_count": spark.read.parquet(USAGE_EVENTS_SILVER).count(),
+        "written_quarantine_count": (
+            spark.read.parquet(USAGE_EVENTS_QUARANTINE).count()
+            if quarantine_count > 0
+            else 0
+        ),
+        "cost_anomalies_flagged": valid_df.filter(F.col("is_cost_anomaly")).count(),
         "quarantine_sample": [row.asDict() for row in quarantine_sample],
     }
 
 
 def run_silver(spark: SparkSession) -> list[dict[str, Any]]:
-    """Ejecuta Silver para maestro + eventos en orden de dependencia."""
-    customers_result = process_customers_orgs_silver(spark)
-    events_result = process_usage_events_silver(spark)
-    return [customers_result, events_result]
+    return [
+        process_customers_orgs_silver(spark),
+        process_usage_events_silver(spark),
+    ]
 
 
 def validate_silver(spark: SparkSession) -> dict[str, Any]:
-    """Valida features, unicidad y balance raw = valid + quarantine."""
     events_silver = spark.read.parquet(USAGE_EVENTS_SILVER)
     events_bronze = spark.read.parquet(USAGE_EVENTS_BRONZE)
 
@@ -261,16 +250,11 @@ if __name__ == "__main__":
     )
     spark.sparkContext.setLogLevel("WARN")
 
-    results = run_silver(spark)
-    for result in results:
+    for result in run_silver(spark):
         print(f"\n=== {result['dataset_name']} ===")
         for key, value in result.items():
             if key != "quarantine_sample":
                 print(f"  {key}: {value}")
-        if result.get("quarantine_sample"):
-            print("  quarantine_sample:")
-            for row in result["quarantine_sample"]:
-                print(f"    {row}")
 
     validation = validate_silver(spark)
     status = (

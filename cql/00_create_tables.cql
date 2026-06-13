@@ -1,7 +1,4 @@
--- Tabla query-first para el mart Gold org_daily_usage_by_service
--- PK: ((org_id), usage_date DESC, service ASC)
--- Consulta #1: costos/requests diarios por org+servicio en rango de fechas
--- Consulta #2: top-N servicios por costo acumulado para una org (agregar en cliente)
+-- Keyspace must exist in Astra console before running this script.
 
 USE cloud_analytics;
 

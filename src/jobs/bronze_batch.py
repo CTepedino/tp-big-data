@@ -1,4 +1,4 @@
-"""Job batch: Landing CSV -> Bronze Parquet."""
+"""Batch job: Landing CSV -> Bronze Parquet."""
 
 from __future__ import annotations
 
@@ -33,7 +33,6 @@ def _parse_double(column_name: str) -> Column:
 
 
 def _landing_relative_source_file(landing_glob: str) -> Column:
-    """Ruta lógica del archivo dentro del datalake, p. ej. landing/customers_orgs.csv."""
     relative_path = os.path.join("landing", os.path.basename(landing_glob))
     return F.lit(relative_path.replace("\\", "/"))
 
@@ -104,7 +103,6 @@ def ingest_master_to_bronze(
     bronze_path: str,
     apply_casts,
 ) -> dict[str, Any]:
-    """Lee CSV desde landing, tipifica, audita, deduplica y escribe Parquet Bronze."""
     df = (
         spark.read.schema(schema)
         .option("header", True)
@@ -129,7 +127,6 @@ def ingest_master_to_bronze(
     )
 
     deduped_count = df_deduped.count()
-    removed_duplicates = raw_count - deduped_count
 
     os.makedirs(bronze_path, exist_ok=True)
     (
@@ -146,17 +143,15 @@ def ingest_master_to_bronze(
         "bronze_path": bronze_path,
         "raw_count": raw_count,
         "deduped_count": deduped_count,
-        "removed_duplicates": removed_duplicates,
+        "removed_duplicates": raw_count - deduped_count,
         "written_count": written_count,
         "dedup_keys": dedup_keys,
     }
 
 
 def run_batch_bronze(spark: SparkSession) -> list[dict[str, Any]]:
-    """Ejecuta la ingesta batch Bronze para los 3 maestros del MVP."""
-    results = []
-    for dataset in BATCH_BRONZE_DATASETS:
-        result = ingest_master_to_bronze(
+    return [
+        ingest_master_to_bronze(
             spark=spark,
             dataset_name=dataset["dataset_name"],
             landing_glob=dataset["landing_glob"],
@@ -165,12 +160,11 @@ def run_batch_bronze(spark: SparkSession) -> list[dict[str, Any]]:
             bronze_path=dataset["bronze_path"],
             apply_casts=dataset["apply_casts"],
         )
-        results.append(result)
-    return results
+        for dataset in BATCH_BRONZE_DATASETS
+    ]
 
 
 def validate_bronze_uniqueness(spark: SparkSession) -> list[dict[str, Any]]:
-    """Valida que no existan duplicados por clave natural en cada dataset Bronze."""
     validations = []
     for dataset in BATCH_BRONZE_DATASETS:
         natural_key = dataset["natural_key"]
@@ -198,9 +192,6 @@ if __name__ == "__main__":
     )
     spark.sparkContext.setLogLevel("WARN")
 
-    print(f"DATA_ROOT landing: {LANDING}")
-    print(f"DATA_ROOT bronze:  {BRONZE}")
-
     results = run_batch_bronze(spark)
     for result in results:
         print(
@@ -208,8 +199,7 @@ if __name__ == "__main__":
             f"deduped={result['deduped_count']} written={result['written_count']}"
         )
 
-    validations = validate_bronze_uniqueness(spark)
-    for validation in validations:
+    for validation in validate_bronze_uniqueness(spark):
         status = "OK" if validation["is_unique"] else "FAIL"
         print(
             f"{validation['dataset_name']} uniqueness [{status}]: "

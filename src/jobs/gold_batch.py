@@ -1,4 +1,4 @@
-"""Job Gold: Silver -> marts de negocio."""
+"""Gold job: Silver -> business marts."""
 
 from __future__ import annotations
 
@@ -15,7 +15,6 @@ ORG_DAILY_USAGE_BY_SERVICE = os.path.join(GOLD, "org_daily_usage_by_service")
 
 
 def build_org_daily_usage_by_service(events_df: DataFrame) -> DataFrame:
-    """Agrega eventos Silver al grano diario por organización y servicio."""
     return (
         events_df.groupBy("org_id", "usage_date", "service")
         .agg(
@@ -37,7 +36,6 @@ def build_org_daily_usage_by_service(events_df: DataFrame) -> DataFrame:
 
 
 def process_org_daily_usage_by_service(spark: SparkSession) -> dict[str, Any]:
-    """Materializa el mart FinOps org_daily_usage_by_service."""
     events_df = spark.read.parquet(USAGE_EVENTS_SILVER)
     silver_count = events_df.count()
 
@@ -53,8 +51,6 @@ def process_org_daily_usage_by_service(spark: SparkSession) -> dict[str, Any]:
     )
 
     written_df = spark.read.parquet(ORG_DAILY_USAGE_BY_SERVICE)
-    written_count = written_df.count()
-
     silver_cost = events_df.agg(F.sum("daily_cost_usd")).collect()[0][0]
     gold_cost = written_df.agg(F.sum("total_daily_cost_usd")).collect()[0][0]
 
@@ -64,7 +60,7 @@ def process_org_daily_usage_by_service(spark: SparkSession) -> dict[str, Any]:
         "gold_path": ORG_DAILY_USAGE_BY_SERVICE,
         "silver_event_count": silver_count,
         "gold_row_count": gold_count,
-        "written_count": written_count,
+        "written_count": written_df.count(),
         "distinct_grain": distinct_grain,
         "grain_unique": gold_count == distinct_grain,
         "silver_total_cost_usd": float(silver_cost or 0),
@@ -74,12 +70,10 @@ def process_org_daily_usage_by_service(spark: SparkSession) -> dict[str, Any]:
 
 
 def run_gold(spark: SparkSession) -> list[dict[str, Any]]:
-    """Ejecuta todos los marts Gold del MVP."""
     return [process_org_daily_usage_by_service(spark)]
 
 
 def validate_gold(spark: SparkSession) -> dict[str, Any]:
-    """Valida grano, métricas y balance de costos."""
     gold_df = spark.read.parquet(ORG_DAILY_USAGE_BY_SERVICE)
     events_df = spark.read.parquet(USAGE_EVENTS_SILVER)
 
@@ -118,8 +112,7 @@ if __name__ == "__main__":
     )
     spark.sparkContext.setLogLevel("WARN")
 
-    results = run_gold(spark)
-    for result in results:
+    for result in run_gold(spark):
         print(f"\n=== {result['mart_name']} ===")
         for key, value in result.items():
             print(f"  {key}: {value}")

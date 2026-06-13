@@ -1,4 +1,4 @@
-"""Schema explícito para ingesta streaming Bronze desde JSONL."""
+"""Bronze streaming schema and streaming parameters."""
 
 import os
 
@@ -29,12 +29,6 @@ USAGE_EVENTS_SCHEMA = StructType(
     ]
 )
 
-# Producción near-real-time (diseño entrega 1)
 WATERMARK_DELAY_PRODUCTION = "10 minutes"
-
-# Replay del landing estático (~60 días): watermark amplio para no descartar histórico
-# en un único availableNow. En vivo, usar WATERMARK_DELAY_PRODUCTION.
 WATERMARK_DELAY = os.environ.get("STREAMING_WATERMARK", "60 days")
-
-# Umbral de negocio para marcar late arrivals (independiente del watermark técnico)
 LATE_DATA_THRESHOLD_SEC = 600

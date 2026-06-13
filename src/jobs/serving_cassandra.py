@@ -1,8 +1,10 @@
-"""Carga Gold -> Cassandra/AstraDB y consultas de evidencia."""
+"""Load Gold into AstraDB and run demo queries."""
 
 from __future__ import annotations
 
 import argparse
+import os
+import sys
 from datetime import date, datetime
 from typing import Any
 
@@ -10,16 +12,24 @@ from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 
 from src.cassandra.client import (
-    CassandraConfigError,
+    AstraConfigError,
     execute_cql_script,
     get_cassandra_session,
-    is_cassandra_configured,
+    is_astra_configured,
     read_cql_file,
+    read_cql_statement,
 )
 from src.config import CASSANDRA_KEYSPACE
 from src.jobs.gold_batch import ORG_DAILY_USAGE_BY_SERVICE
 
 TABLE_NAME = "org_daily_usage_by_service"
+CQL_CREATE_TABLES = "00_create_tables.cql"
+CQL_QUERY_DAILY_COSTS = "01_daily_costs_and_requests.cql"
+CQL_QUERY_TOP_SERVICES = "02_top_services_by_cost.cql"
+
+DEFAULT_CONCURRENCY = int(os.environ.get("CASSANDRA_LOAD_CONCURRENCY", "50"))
+DEFAULT_PROGRESS_EVERY = int(os.environ.get("CASSANDRA_PROGRESS_EVERY", "500"))
+
 INSERT_CQL = f"""
 INSERT INTO {TABLE_NAME} (
     org_id, usage_date, service,
@@ -47,14 +57,9 @@ def _to_bool(value) -> bool:
     return bool(int(value))
 
 
-def setup_keyspace_and_table(session) -> None:
-    """Ejecuta DDL desde scripts CQL."""
-    keyspace_script = read_cql_file("01_keyspace.cql")
-    execute_cql_script(session, keyspace_script)
+def setup_table(session) -> None:
     session.set_keyspace(CASSANDRA_KEYSPACE)
-
-    table_script = read_cql_file("02_org_daily_usage_by_service.cql")
-    execute_cql_script(session, table_script)
+    execute_cql_script(session, read_cql_file(CQL_CREATE_TABLES))
 
 
 def _row_to_params(row: dict[str, Any]) -> tuple:
@@ -80,34 +85,63 @@ def load_org_daily_usage_by_service(
     spark: SparkSession,
     session,
     *,
-    batch_size: int = 100,
+    concurrency: int = DEFAULT_CONCURRENCY,
+    progress_every: int = DEFAULT_PROGRESS_EVERY,
+    skip_if_loaded: bool = True,
 ) -> dict[str, Any]:
-    """Carga idempotente (upsert por PK) desde Gold Parquet."""
+    from cassandra.concurrent import execute_concurrent_with_args
+
     gold_df = spark.read.parquet(ORG_DAILY_USAGE_BY_SERVICE)
     gold_count = gold_df.count()
 
-    count_before = session.execute(f"SELECT COUNT(*) FROM {TABLE_NAME}").one()[0]
+    rows = [row.asDict() for row in gold_df.collect()]
+    params = [_row_to_params(row) for row in rows]
+
+    count_before = None
+    if skip_if_loaded and rows:
+        sample_org = rows[0]["org_id"]
+        count_before = session.execute(
+            f"SELECT COUNT(*) FROM {TABLE_NAME} WHERE org_id = %s",
+            (sample_org,),
+        ).one()[0]
+        if count_before > 0:
+            print(
+                f"  Sample org_id={sample_org}: {count_before} rows. "
+                "Continuing idempotent upsert..."
+            )
 
     prepared = session.prepare(INSERT_CQL)
-    rows = [row.asDict() for row in gold_df.collect()]
+    print(f"  Loading {gold_count} rows (concurrency={concurrency})...")
 
     inserted = 0
-    for i in range(0, len(rows), batch_size):
-        batch_rows = rows[i : i + batch_size]
-        for row in batch_rows:
-            session.execute(prepared, _row_to_params(row))
-            inserted += 1
-
-    count_after = session.execute(f"SELECT COUNT(*) FROM {TABLE_NAME}").one()[0]
+    errors = 0
+    for start in range(0, len(params), progress_every):
+        chunk = params[start : start + progress_every]
+        chunk_results = execute_concurrent_with_args(
+            session,
+            prepared,
+            chunk,
+            concurrency=concurrency,
+            raise_on_first_error=False,
+        )
+        for success, result in chunk_results:
+            if success:
+                inserted += 1
+            else:
+                errors += 1
+                if errors <= 3:
+                    print(f"  INSERT error: {result}", file=sys.stderr)
+        done = min(start + progress_every, len(params))
+        print(f"  Progress: {done}/{len(params)} rows sent")
 
     return {
         "table_name": TABLE_NAME,
         "gold_path": ORG_DAILY_USAGE_BY_SERVICE,
         "gold_row_count": gold_count,
         "rows_upserted": inserted,
-        "count_before": count_before,
-        "count_after": count_after,
-        "idempotent_ok": count_after == gold_count,
+        "insert_errors": errors,
+        "sample_org_count_before": count_before,
+        "idempotent_ok": errors == 0 and inserted == gold_count,
     }
 
 
@@ -118,15 +152,7 @@ def run_query_daily_costs_and_requests(
     start_date: str = "2025-07-01",
     end_date: str = "2025-08-31",
 ) -> list[dict[str, Any]]:
-    """Consulta #1: costos y requests diarios por org y servicio."""
-    cql = f"""
-        SELECT usage_date, service, total_daily_cost_usd, total_requests,
-               total_genai_tokens, total_carbon_kg
-        FROM {TABLE_NAME}
-        WHERE org_id = %s
-          AND usage_date >= %s
-          AND usage_date <= %s
-    """
+    cql = read_cql_statement(CQL_QUERY_DAILY_COSTS)
     rows = session.execute(
         cql,
         (org_id, date.fromisoformat(start_date), date.fromisoformat(end_date)),
@@ -142,14 +168,7 @@ def run_query_top_services_by_cost(
     end_date: str = "2025-08-31",
     top_n: int = 5,
 ) -> list[dict[str, Any]]:
-    """Consulta #2: top-N servicios por costo acumulado (agregación en driver)."""
-    cql = f"""
-        SELECT service, usage_date, total_daily_cost_usd
-        FROM {TABLE_NAME}
-        WHERE org_id = %s
-          AND usage_date >= %s
-          AND usage_date <= %s
-    """
+    cql = read_cql_statement(CQL_QUERY_TOP_SERVICES)
     rows = session.execute(
         cql,
         (org_id, date.fromisoformat(start_date), date.fromisoformat(end_date)),
@@ -172,15 +191,20 @@ def run_serving(
     spark: SparkSession,
     *,
     setup_ddl: bool = True,
+    skip_load: bool = False,
     org_id: str = "org_rixa11dp",
 ) -> dict[str, Any]:
-    """Pipeline completo: DDL + carga + consultas #1 y #2."""
     session, cluster = get_cassandra_session()
     try:
         if setup_ddl:
-            setup_keyspace_and_table(session)
+            setup_table(session)
 
-        load_result = load_org_daily_usage_by_service(spark, session)
+        load_result = None
+        if not skip_load:
+            load_result = load_org_daily_usage_by_service(spark, session)
+        else:
+            print("  Load skipped (--skip-load).")
+
         query1 = run_query_daily_costs_and_requests(session, org_id=org_id)
         query2 = run_query_top_services_by_cost(session, org_id=org_id)
 
@@ -195,7 +219,6 @@ def run_serving(
 
 
 def dry_run_preview(spark: SparkSession) -> dict[str, Any]:
-    """Preview sin conexión: valida Gold listo para carga."""
     gold_df = spark.read.parquet(ORG_DAILY_USAGE_BY_SERVICE)
     sample = gold_df.limit(3).collect()
     top_org = (
@@ -208,16 +231,21 @@ def dry_run_preview(spark: SparkSession) -> dict[str, Any]:
         "gold_row_count": gold_df.count(),
         "sample_rows": [row.asDict() for row in sample],
         "suggested_org_id_for_queries": top_org["org_id"] if top_org else "org_rixa11dp",
-        "cassandra_configured": is_cassandra_configured(),
+        "astra_configured": is_astra_configured(),
     }
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Cargar Gold en Cassandra/AstraDB")
+    parser = argparse.ArgumentParser(description="Load Gold into AstraDB")
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Validar Gold sin conectar a Cassandra",
+        help="Validate Gold without connecting to AstraDB",
+    )
+    parser.add_argument(
+        "--skip-load",
+        action="store_true",
+        help="Run DDL and queries only; skip Gold load",
     )
     args = parser.parse_args()
 
@@ -230,32 +258,38 @@ if __name__ == "__main__":
 
     if args.dry_run:
         preview = dry_run_preview(spark)
-        print("DRY RUN — Gold listo para carga:")
+        print("DRY RUN — Gold ready to load:")
         for key, value in preview.items():
             if key != "sample_rows":
                 print(f"  {key}: {value}")
         spark.stop()
         raise SystemExit(0)
 
-    if not is_cassandra_configured():
+    if not is_astra_configured():
         preview = dry_run_preview(spark)
-        print("Gold listo para carga, pero faltan credenciales Cassandra/Astra:")
+        print("Gold ready to load, but AstraDB credentials are missing:")
         print(f"  gold_row_count: {preview['gold_row_count']}")
         print(
-            "\nConfigurar ASTRA_DB_APPLICATION_TOKEN y "
-            "ASTRA_DB_SECURE_BUNDLE_PATH (ver .env.example)."
+            "\nSet ASTRA_DB_APPLICATION_TOKEN and "
+            "ASTRA_DB_SECURE_BUNDLE_PATH (see .env.example)."
         )
         spark.stop()
         raise SystemExit(1)
 
     try:
-        result = run_serving(spark)
+        result = run_serving(spark, skip_load=args.skip_load)
         print("LOAD:", result["load"])
         print(f"QUERY #1 rows: {result['query1_rows']}")
         print("QUERY #1 sample:", result["query1_sample"])
         print("QUERY #2 top:", result["query2_top"])
-    except CassandraConfigError as exc:
+    except AstraConfigError as exc:
         print(f"ERROR: {exc}")
         raise SystemExit(1) from exc
+    except KeyboardInterrupt:
+        print("\nCancelled by user.", file=sys.stderr)
+        raise SystemExit(130)
     finally:
-        spark.stop()
+        try:
+            spark.stop()
+        except Exception:
+            pass

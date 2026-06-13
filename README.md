@@ -1,6 +1,6 @@
 # Cloud Provider Analytics
 
-Pipeline de datos end-to-end para el challenge **Cloud Provider Analytics** (Big Data P2).
+Pipeline de datos end-to-end para **Cloud Provider Analytics**
 
 ```text
 Landing → Bronze → Silver → Gold → Serving (Cassandra/AstraDB)
@@ -10,7 +10,7 @@ Landing → Bronze → Silver → Gold → Serving (Cassandra/AstraDB)
 - **Streaming:** eventos JSONL (`usage_events_stream/*.jsonl`)
 - **Serving:** mart FinOps `org_daily_usage_by_service` en AstraDB
 
-Patrón arquitectónico: **Lambda** (batch + streaming). Decisiones técnicas en [`docs/LOG_DECISIONES.md`](docs/LOG_DECISIONES.md).
+Patrón arquitectónico: **Lambda** (batch + streaming)
 
 ---
 
@@ -35,7 +35,7 @@ cloud-provider-analytics/
 │   ├── gold/                     # Marts de negocio
 │   ├── quarantine/               # Registros rechazados
 │   └── checkpoints/              # Structured Streaming
-├── notebooks/                    # Orquestación Colab/local (01–05)
+├── notebooks/                    # Orquestación Colab/local
 ├── src/
 │   ├── config.py                 # Rutas y credenciales
 │   ├── cassandra/                # Cliente AstraDB
@@ -77,7 +77,8 @@ Variables de entorno relevantes:
 | `CASSANDRA_KEYSPACE` | Keyspace Astra | `cloud_analytics` |
 | `ASTRA_DB_APPLICATION_TOKEN` | Token de aplicación | — |
 | `ASTRA_DB_SECURE_BUNDLE_PATH` | Ruta al `.zip` del bundle | — |
-| `STREAMING_WATERMARK` | Watermark replay estático | `60 days` |
+| `CASSANDRA_LOAD_CONCURRENCY` | Hilos paralelos para INSERT | `50` |
+| `CASSANDRA_PROGRESS_EVERY` | Cada cuántas filas imprimir progreso | `500` |
 
 ---
 
@@ -127,34 +128,253 @@ python -m src.jobs.serving_cassandra --dry-run
 
 # Carga real (requiere token + bundle)
 python -m src.jobs.serving_cassandra
+
+# Si la tabla ya está cargada, solo consultas:
+python -m src.jobs.serving_cassandra --skip-load
 ```
 
 Ejecuta DDL, carga 12.114 filas Gold y corre consultas #1 y #2.
 
 ---
 
-## Setup AstraDB
+## Setup AstraDB (guía detallada)
 
-1. Crear base en [AstraDB](https://astra.datastax.com)
-2. Descargar **Secure Connect Bundle** (`.zip`)
-3. Generar **Application Token** con rol Database Administrator
-4. Configurar:
+### ¿Vector o normal?
 
-```bash
-export CASSANDRA_KEYSPACE=cloud_analytics
-export ASTRA_DB_APPLICATION_TOKEN="AstraCS:..."
-export ASTRA_DB_SECURE_BUNDLE_PATH="/ruta/secure-connect-cloud-analytics.zip"
+Astra ofrece dos tipos de base **Serverless**. Para este proyecto necesitás una base **Cassandra clásica** con consultas CQL sobre tablas — no embeddings ni búsqueda semántica.
+
+| Tipo en el portal | ¿Sirve para este proyecto? | Cuándo usarla |
+|---|---|---|
+| **Serverless (non-vector)** | **Sí — recomendada** | Tablas CQL, marts analíticos, serving query-first (nuestro caso) |
+| **Serverless (vector)** | Sí, también funciona | Apps de GenAI / RAG con vector search; admite tablas no-vector, pero no la necesitamos |
+
+**Elegí Serverless (non-vector)** para evitar confusiones. Si ya creaste una vector por error, podés usarla igual: el job conecta por `cassandra-driver` + CQL y funciona en ambos tipos.
+
+Lo que **no** necesitás en este MVP:
+- Collections de la Data API para embeddings
+- `vectorize` ni modelos de embedding
+
+### Conexión a Astra (requerida)
+
+El Serving usa `cassandra-driver` con **dos credenciales obligatorias**:
+
+| Variable | Descripción |
+|---|---|
+| `ASTRA_DB_APPLICATION_TOKEN` | Token de aplicación (`AstraCS:...`) |
+| `ASTRA_DB_SECURE_BUNDLE_PATH` | Ruta al `.zip` del Secure Connect Bundle |
+
+El bundle descarga la configuración TLS y los endpoints de tu base. Sin él, el driver no puede conectarse a Astra.
+
+En Colab, subí el `.zip` una vez y apuntá la ruta:
+
+```python
+os.environ["ASTRA_DB_SECURE_BUNDLE_PATH"] = "/content/secure-connect-cloud-analytics.zip"
 ```
 
-5. Ejecutar `python -m src.jobs.serving_cassandra`
+---
 
-DDL manual (alternativa): `cql/01_keyspace.cql` → `cql/02_org_daily_usage_by_service.cql`
+### Paso 1 — Crear cuenta y base
+
+1. Entrá a [https://astra.datastax.com](https://astra.datastax.com) y registrate (hay tier gratuito).
+2. En el menú lateral: **Databases** → **Create Database**.
+3. Completá el formulario:
+
+| Campo | Valor sugerido |
+|---|---|
+| **Database name** | `cloud-analytics` (o el nombre que prefieras) |
+| **Deployment type** | **Serverless (non-vector)** |
+| **Cloud provider** | AWS, GCP o Azure (cualquiera; elegí la región más cercana) |
+| **Region** | La más cercana a donde corrés el pipeline (ej. `us-east-1`) |
+
+4. Click **Create Database** y esperá a que el estado pase a **Active** (1–3 minutos).
+
+### Paso 1b — Crear keyspace `cloud_analytics` (obligatorio en Astra)
+
+Astra **no permite** `CREATE KEYSPACE` por CQL ni por el driver. Si no creás el keyspace antes, vas a ver:
+
+```text
+Unauthorized: Missing correct permission on cloud_analytics.
+```
+
+Creación manual:
+
+1. Abrí tu base en la consola Astra.
+2. Menú **Keyspaces** (o pestaña **CQL** → sección keyspaces).
+3. Click **Add Keyspace**.
+4. Nombre: `cloud_analytics` (debe coincidir con `CASSANDRA_KEYSPACE` en `.env`).
+5. Confirmá.
+
+> Si usás otro nombre de keyspace, actualizá `CASSANDRA_KEYSPACE` en `.env`.
+
+---
+
+### Paso 2 — Descargar el Secure Connect Bundle
+
+El bundle es un `.zip` con la configuración TLS y endpoints de tu base.
+
+1. En la consola Astra, abrí tu base `cloud-analytics`.
+2. Pestaña **Connect** (o **Database Settings** → **Connect`).
+3. En **Node connect** / **Drivers**, click **Download secure connect bundle**.
+4. Guardá el archivo, por ejemplo:
+   - Local: `~/Downloads/secure-connect-cloud-analytics.zip`
+   - Colab: subilo a Drive o a `/content/secure-connect-cloud-analytics.zip`
+
+Ese path va en `ASTRA_DB_SECURE_BUNDLE_PATH`.
+
+---
+
+### Paso 3 — Crear Application Token
+
+El token reemplaza usuario/contraseña para conectarte desde Python.
+
+1. En la consola Astra, abrí **tu base** → pestaña **Connect** → **Generate token** (así queda scoped a esa base).
+2. Si usás **Settings** → **Application Tokens**, asegurate de que el rol sea **Database Administrator** para la base correcta.
+3. Configuración sugerida:
+
+| Campo | Valor |
+|---|---|
+| **Token name** | `cloud-analytics-pipeline` |
+| **Role** | **Database Administrator** (permite CREATE KEYSPACE/TABLE e INSERT) |
+
+4. Copiá el token (`AstraCS:...`) — **solo se muestra una vez**.
+
+> Para solo leer datos en demos, alcanza con rol **Database User**. Para ejecutar el job de carga (DDL + INSERT), usá **Database Administrator**.
+
+---
+
+### Paso 4 — Configurar credenciales en el proyecto
+
+```bash
+cp .env.example .env
+```
+
+Editá `.env`:
+
+```bash
+CASSANDRA_KEYSPACE=cloud_analytics
+ASTRA_DB_APPLICATION_TOKEN=AstraCS:tu_token_aqui
+ASTRA_DB_SECURE_BUNDLE_PATH=/ruta/completa/secure-connect-cloud-analytics.zip
+```
+
+Cargá las variables:
+
+```bash
+set -a && source .env && set +a
+# o manualmente:
+export ASTRA_DB_APPLICATION_TOKEN="AstraCS:..."
+export ASTRA_DB_SECURE_BUNDLE_PATH="/home/usuario/secure-connect-cloud-analytics.zip"
+```
+
+**En Google Colab** (celda inicial):
+
+```python
+import os
+os.environ["ASTRA_DB_APPLICATION_TOKEN"] = "AstraCS:..."
+os.environ["ASTRA_DB_SECURE_BUNDLE_PATH"] = "/content/secure-connect-cloud-analytics.zip"
+# Si el bundle está en Drive:
+# !cp "/content/drive/MyDrive/secure-connect-cloud-analytics.zip" /content/
+```
+
+---
+
+### Paso 5 — Verificar Gold y cargar datos
+
+Asegurate de tener el mart Gold generado antes de cargar:
+
+```bash
+python -m src.jobs.gold_batch   # si aún no corrido
+
+# Preview sin conectar a Astra
+python -m src.jobs.serving_cassandra --dry-run
+# Debe mostrar: gold_row_count: 12114
+
+# Carga real + consultas #1 y #2
+python -m src.jobs.serving_cassandra
+```
+
+El job hace automáticamente:
+1. `CREATE TABLE` (desde `cql/00_create_tables.cql`) — el keyspace debe existir en consola Astra (Paso 1b)
+2. INSERT de 12.114 filas desde Gold (upsert por PK)
+3. Consulta #1: costos/requests por rango de fechas
+4. Consulta #2: top-5 servicios por costo acumulado
+
+---
+
+### Paso 6 — Consultar desde la consola Astra (CQL Console)
+
+Para capturas de pantalla de la entrega:
+
+1. Consola Astra → tu base → pestaña **CQL Console**.
+2. Ejecutá los scripts de `cql/`:
+   - [`cql/01_daily_costs_and_requests.cql`](cql/01_daily_costs_and_requests.cql)
+   - [`cql/02_top_services_by_cost.cql`](cql/02_top_services_by_cost.cql)
+3. Reemplazá `org_id` si querés la org con más costo (`org_53lc58dr` según el dry-run). En consola usá valores literales en lugar de `%s`.
+
+Ejemplo consulta #1:
+
+```sql
+USE cloud_analytics;
+
+SELECT usage_date, service, total_daily_cost_usd, total_requests
+FROM org_daily_usage_by_service
+WHERE org_id = 'org_rixa11dp'
+  AND usage_date >= '2025-07-01'
+  AND usage_date <= '2025-08-31';
+```
+
+Verificá que hay datos:
+
+```sql
+SELECT COUNT(*) FROM org_daily_usage_by_service;
+-- Esperado: 12114
+```
+
+---
+
+### DDL manual (alternativa al job)
+
+Si preferís crear el esquema a mano en CQL Console antes de cargar:
+
+1. Creá el keyspace `cloud_analytics` en consola Astra (Paso 1b)
+2. Ejecutá [`cql/00_create_tables.cql`](cql/00_create_tables.cql)
+3. Corré solo la carga: `python -m src.jobs.serving_cassandra`
+
+---
+
+### Modelo de tabla (referencia)
+
+```sql
+PRIMARY KEY ((org_id), usage_date, service)
+WITH CLUSTERING ORDER BY (usage_date DESC, service ASC);
+```
+
+Diseño **query-first**: una partición por organización, filas ordenadas por fecha descendente y servicio. Las consultas del MVP filtran por `org_id` + rango de `usage_date` sin `ALLOW FILTERING`.
+
+---
+
+### Troubleshooting
+
+| Problema | Causa probable | Solución |
+|---|---|---|
+| `Missing correct permission on cloud_analytics` | Keyspace no existe en Astra o token sin rol admin | Crear keyspace `cloud_analytics` en consola Astra (Paso 1b); regenerar token **Database Administrator** desde la pestaña **Connect** de **esa** base |
+| `Secure connect bundle not found` | Path incorrecto al `.zip` | Verificá `ASTRA_DB_SECURE_BUNDLE_PATH` con ruta absoluta |
+| `Authentication failed` | Token inválido, expirado o de otra base | Generá token nuevo desde **Connect** de tu base con rol **Database Administrator** |
+| `Keyspace does not exist` | Keyspace no creado en consola | Crear `cloud_analytics` en Astra (Paso 1b) antes de correr el job |
+| Script parece congelado durante carga | INSERT fila a fila + `COUNT(*)` full table en Astra | Versión actual usa carga concurrente y muestra progreso; si ya cargaste: `--skip-load` |
+| Carga lenta | 12k INSERTs secuenciales | Normal en free tier; el job tarda ~1–2 min |
+| Elegiste Vector por error | Tipo de base incorrecto | Funciona igual con CQL; para próximos proyectos usá non-vector |
 
 ---
 
 ## Consultas de demostración (AstraDB)
 
-Definidas en [`cql/03_queries.cql`](cql/03_queries.cql):
+Scripts CQL:
+
+| Archivo | Propósito |
+|---|---|
+| [`cql/00_create_tables.cql`](cql/00_create_tables.cql) | DDL de la tabla |
+| [`cql/01_daily_costs_and_requests.cql`](cql/01_daily_costs_and_requests.cql) | Consulta #1 |
+| [`cql/02_top_services_by_cost.cql`](cql/02_top_services_by_cost.cql) | Consulta #2 (agregar top-N en app) |
 
 **#1 — Costos y requests diarios por org y servicio (rango de fechas)**
 
@@ -172,17 +392,21 @@ CQL trae filas por `(org_id, usage_date, service)`; el top-N se calcula agregand
 
 ---
 
-## Notebooks (Colab o local)
+## Notebook (Colab o local)
 
-| Notebook | Capa |
-|---|---|
-| [`01_batch_bronze.ipynb`](notebooks/01_batch_bronze.ipynb) | Bronze batch |
-| [`02_streaming_bronze.ipynb`](notebooks/02_streaming_bronze.ipynb) | Bronze streaming |
-| [`03_silver.ipynb`](notebooks/03_silver.ipynb) | Silver |
-| [`04_gold.ipynb`](notebooks/04_gold.ipynb) | Gold |
-| [`05_serving_cassandra.ipynb`](notebooks/05_serving_cassandra.ipynb) | Serving AstraDB |
+[`notebooks/pipeline_completo.ipynb`](notebooks/pipeline.ipynb) — ejecuta el pipeline end-to-end (Bronze batch → Bronze streaming → Silver → Gold → Serving AstraDB) con evidencias y validaciones por capa.
 
 En Colab: montar Drive, copiar repo + dataset, instalar dependencias y setear variables de Astra en la primera celda.
+
+Para correr un paso suelto, usá los módulos CLI:
+
+```bash
+python -m src.jobs.bronze_batch
+python -m src.jobs.bronze_streaming
+python -m src.jobs.silver_batch
+python -m src.jobs.gold_batch
+python -m src.jobs.serving_cassandra
+```
 
 ---
 
@@ -209,10 +433,3 @@ En Colab: montar Drive, copiar repo + dataset, instalar dependencias y setear va
 - [x] Cassandra — DDL, job de carga, consultas #1 y #2
 - [ ] Capturas de consultas AstraDB (requiere ejecución con credenciales reales)
 
----
-
-## Documentación adicional
-
-- [`docs/LOG_DECISIONES.md`](docs/LOG_DECISIONES.md) — Lambda/Kappa, particiones, claves Cassandra, umbrales
-- [`docs/Consigna parcial2.txt`](docs/Consigna%20parcial2.txt) — requisitos del MVP
-- [`docs/Big Data Primer Entrega.md`](docs/Big%20Data%20Primer%20Entrega.md) — diseño arquitectónico (entrega 1)

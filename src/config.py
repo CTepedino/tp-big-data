@@ -1,4 +1,4 @@
-"""Rutas del datalake configurables para ejecución local o en Colab."""
+"""Datalake paths and AstraDB settings."""
 
 import os
 from pathlib import Path
@@ -28,12 +28,8 @@ GOLD = os.path.join(DATA_ROOT, "gold")
 QUARANTINE = os.path.join(DATA_ROOT, "quarantine")
 CHECKPOINTS = os.path.join(DATA_ROOT, "checkpoints")
 
-# Cassandra / AstraDB
 CASSANDRA_KEYSPACE = os.environ.get("CASSANDRA_KEYSPACE", "cloud_analytics")
 ASTRA_DB_APPLICATION_TOKEN = os.environ.get("ASTRA_DB_APPLICATION_TOKEN", "")
 ASTRA_DB_SECURE_BUNDLE_PATH = os.environ.get("ASTRA_DB_SECURE_BUNDLE_PATH", "")
-CASSANDRA_CONTACT_POINTS = os.environ.get("CASSANDRA_CONTACT_POINTS", "")
-CASSANDRA_USERNAME = os.environ.get("CASSANDRA_USERNAME", "")
-CASSANDRA_PASSWORD = os.environ.get("CASSANDRA_PASSWORD", "")
 
 CQL_DIR = str(Path(__file__).resolve().parent.parent / "cql")

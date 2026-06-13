@@ -1,79 +1,51 @@
-"""Cliente Cassandra / AstraDB."""
+"""AstraDB client."""
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 from src.config import (
     ASTRA_DB_APPLICATION_TOKEN,
     ASTRA_DB_SECURE_BUNDLE_PATH,
-    CASSANDRA_CONTACT_POINTS,
     CASSANDRA_KEYSPACE,
-    CASSANDRA_PASSWORD,
-    CASSANDRA_USERNAME,
     CQL_DIR,
 )
 
 
-class CassandraConfigError(RuntimeError):
-    """Faltan variables de entorno para conectar a Astra/Cassandra."""
+class AstraConfigError(RuntimeError):
+    """Missing or invalid AstraDB configuration."""
 
 
 def is_astra_configured() -> bool:
     return bool(ASTRA_DB_APPLICATION_TOKEN and ASTRA_DB_SECURE_BUNDLE_PATH)
 
 
-def is_local_cassandra_configured() -> bool:
-    return bool(CASSANDRA_CONTACT_POINTS)
-
-
-def is_cassandra_configured() -> bool:
-    return is_astra_configured() or is_local_cassandra_configured()
-
-
 def get_cassandra_session():
-    """Abre sesión contra AstraDB (bundle) o Cassandra local."""
-    if not is_cassandra_configured():
-        raise CassandraConfigError(
-            "Configurar ASTRA_DB_APPLICATION_TOKEN + ASTRA_DB_SECURE_BUNDLE_PATH "
-            "o CASSANDRA_CONTACT_POINTS para cargar/consultar."
+    if not is_astra_configured():
+        raise AstraConfigError(
+            "Set ASTRA_DB_APPLICATION_TOKEN and ASTRA_DB_SECURE_BUNDLE_PATH "
+            "(see .env.example)."
         )
 
     from cassandra.cluster import Cluster
     from cassandra.auth import PlainTextAuthProvider
 
-    if is_astra_configured():
-        bundle_path = Path(ASTRA_DB_SECURE_BUNDLE_PATH)
-        if not bundle_path.exists():
-            raise CassandraConfigError(
-                f"No se encontró el secure bundle: {bundle_path}"
-            )
-        auth = PlainTextAuthProvider("token", ASTRA_DB_APPLICATION_TOKEN)
-        cluster = Cluster(
-            cloud={"secure_connect_bundle": str(bundle_path)},
-            auth_provider=auth,
-        )
-    else:
-        hosts = [host.strip() for host in CASSANDRA_CONTACT_POINTS.split(",")]
-        auth = None
-        if CASSANDRA_USERNAME:
-            auth = PlainTextAuthProvider(CASSANDRA_USERNAME, CASSANDRA_PASSWORD)
-        cluster = Cluster(hosts, auth_provider=auth)
+    bundle_path = Path(ASTRA_DB_SECURE_BUNDLE_PATH)
+    if not bundle_path.exists():
+        raise AstraConfigError(f"Secure connect bundle not found: {bundle_path}")
 
+    auth = PlainTextAuthProvider("token", ASTRA_DB_APPLICATION_TOKEN)
+    cluster = Cluster(
+        cloud={"secure_connect_bundle": str(bundle_path)},
+        auth_provider=auth,
+    )
     session = cluster.connect()
     session.set_keyspace(CASSANDRA_KEYSPACE)
     return session, cluster
 
 
-def read_cql_file(filename: str) -> str:
-    path = Path(CQL_DIR) / filename
-    return path.read_text(encoding="utf-8")
-
-
-def execute_cql_script(session, script: str) -> None:
-    """Ejecuta un script CQL statement por statement."""
-    statements = []
+def _parse_cql_statements(script: str) -> list[str]:
+    statements: list[str] = []
     buffer: list[str] = []
     for line in script.splitlines():
         stripped = line.strip()
@@ -83,6 +55,22 @@ def execute_cql_script(session, script: str) -> None:
         if stripped.endswith(";"):
             statements.append("\n".join(buffer))
             buffer = []
+    return statements
 
-    for statement in statements:
+
+def read_cql_file(filename: str) -> str:
+    return (Path(CQL_DIR) / filename).read_text(encoding="utf-8")
+
+
+def read_cql_statement(filename: str) -> str:
+    statements = _parse_cql_statements(read_cql_file(filename))
+    if not statements:
+        raise ValueError(f"No CQL statements found in {filename}")
+    if len(statements) > 1:
+        raise ValueError(f"Expected one statement in {filename}, found {len(statements)}")
+    return statements[0]
+
+
+def execute_cql_script(session, script: str) -> None:
+    for statement in _parse_cql_statements(script):
         session.execute(statement)

@@ -1,3 +1,1 @@
-"""Jobs del pipeline de datos."""
-
-__all__ = []
+"""Pipeline jobs."""

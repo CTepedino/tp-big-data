@@ -1,4 +1,4 @@
-"""Schemas explícitos para ingesta batch Bronze desde CSV."""
+"""Explicit CSV schemas for batch Bronze ingestion."""
 
 from pyspark.sql.types import StringType, StructField, StructType
 
@@ -42,39 +42,3 @@ BILLING_MONTHLY_SCHEMA = StructType(
         StructField("exchange_rate_to_usd", StringType(), nullable=True),
     ]
 )
-
-# Tipos objetivo Bronze (post-cast) documentados para referencia downstream.
-CUSTOMERS_ORGS_BRONZE_COLUMNS = {
-    "org_id": "string",
-    "org_name": "string",
-    "industry": "string",
-    "hq_region": "string",
-    "plan_tier": "string",
-    "is_enterprise": "boolean",
-    "signup_date": "date",
-    "sales_rep": "string",
-    "lifecycle_stage": "string",
-    "marketing_source": "string",
-    "nps_score": "double",
-}
-
-USERS_BRONZE_COLUMNS = {
-    "user_id": "string",
-    "org_id": "string",
-    "email": "string",
-    "role": "string",
-    "active": "boolean",
-    "created_at": "date",
-    "last_login": "date",
-}
-
-BILLING_MONTHLY_BRONZE_COLUMNS = {
-    "invoice_id": "string",
-    "org_id": "string",
-    "month": "date",
-    "subtotal": "double",
-    "credits": "double",
-    "taxes": "double",
-    "currency": "string",
-    "exchange_rate_to_usd": "double",
-}
