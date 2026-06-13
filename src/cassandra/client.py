@@ -62,15 +62,6 @@ def read_cql_file(filename: str) -> str:
     return (Path(CQL_DIR) / filename).read_text(encoding="utf-8")
 
 
-def read_cql_statement(filename: str) -> str:
-    statements = _parse_cql_statements(read_cql_file(filename))
-    if not statements:
-        raise ValueError(f"No CQL statements found in {filename}")
-    if len(statements) > 1:
-        raise ValueError(f"Expected one statement in {filename}, found {len(statements)}")
-    return statements[0]
-
-
 def execute_cql_script(session, script: str) -> None:
     for statement in _parse_cql_statements(script):
         session.execute(statement)

@@ -4,6 +4,19 @@ import os
 from pathlib import Path
 
 
+def _load_dotenv() -> None:
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        return
+
+    repo_root = Path(__file__).resolve().parent.parent
+    load_dotenv(repo_root / ".env")
+
+
+_load_dotenv()
+
+
 def _default_data_root() -> str:
     env_root = os.environ.get("DATA_ROOT")
     if env_root:

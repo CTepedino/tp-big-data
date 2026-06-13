@@ -9,7 +9,6 @@ from datetime import date, datetime
 from typing import Any
 
 from pyspark.sql import SparkSession
-from pyspark.sql import functions as F
 
 from src.cassandra.client import (
     AstraConfigError,
@@ -17,30 +16,20 @@ from src.cassandra.client import (
     get_cassandra_session,
     is_astra_configured,
     read_cql_file,
-    read_cql_statement,
+)
+from src.cassandra.queries import (
+    INSERT_CQL,
+    QUERY_DAILY_COSTS,
+    QUERY_TOP_SERVICES,
+    TABLE_NAME,
 )
 from src.config import CASSANDRA_KEYSPACE
 from src.jobs.gold_batch import ORG_DAILY_USAGE_BY_SERVICE
 
-TABLE_NAME = "org_daily_usage_by_service"
 CQL_CREATE_TABLES = "00_create_tables.cql"
-CQL_QUERY_DAILY_COSTS = "01_daily_costs_and_requests.cql"
-CQL_QUERY_TOP_SERVICES = "02_top_services_by_cost.cql"
 
 DEFAULT_CONCURRENCY = int(os.environ.get("CASSANDRA_LOAD_CONCURRENCY", "50"))
 DEFAULT_PROGRESS_EVERY = int(os.environ.get("CASSANDRA_PROGRESS_EVERY", "500"))
-
-INSERT_CQL = f"""
-INSERT INTO {TABLE_NAME} (
-    org_id, usage_date, service,
-    org_name, org_industry, org_plan_tier,
-    event_count, total_daily_cost_usd, total_requests,
-    total_genai_tokens, total_carbon_kg,
-    anomaly_event_count, has_cost_anomaly, gold_ts
-) VALUES (
-    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-)
-"""
 
 
 def _to_date(value) -> date:
@@ -152,9 +141,8 @@ def run_query_daily_costs_and_requests(
     start_date: str = "2025-07-01",
     end_date: str = "2025-08-31",
 ) -> list[dict[str, Any]]:
-    cql = read_cql_statement(CQL_QUERY_DAILY_COSTS)
     rows = session.execute(
-        cql,
+        QUERY_DAILY_COSTS,
         (org_id, date.fromisoformat(start_date), date.fromisoformat(end_date)),
     )
     return [dict(row._asdict()) for row in rows]
@@ -164,13 +152,12 @@ def run_query_top_services_by_cost(
     session,
     *,
     org_id: str = "org_rixa11dp",
-    start_date: str = "2025-08-17",
+    start_date: str = "2025-08-18",
     end_date: str = "2025-08-31",
     top_n: int = 5,
 ) -> list[dict[str, Any]]:
-    cql = read_cql_statement(CQL_QUERY_TOP_SERVICES)
     rows = session.execute(
-        cql,
+        QUERY_TOP_SERVICES,
         (org_id, date.fromisoformat(start_date), date.fromisoformat(end_date)),
     )
 
@@ -182,7 +169,7 @@ def run_query_top_services_by_cost(
 
     ranked = sorted(totals.items(), key=lambda item: item[1], reverse=True)[:top_n]
     return [
-        {"org_id": org_id, "service": service, "accumulated_cost_usd": cost}
+        {"service": service, "accumulated_cost_usd": cost}
         for service, cost in ranked
     ]
 
@@ -218,30 +205,8 @@ def run_serving(
         cluster.shutdown()
 
 
-def dry_run_preview(spark: SparkSession) -> dict[str, Any]:
-    gold_df = spark.read.parquet(ORG_DAILY_USAGE_BY_SERVICE)
-    sample = gold_df.limit(3).collect()
-    top_org = (
-        gold_df.groupBy("org_id")
-        .agg(F.sum("total_daily_cost_usd").alias("cost"))
-        .orderBy(F.desc("cost"))
-        .first()
-    )
-    return {
-        "gold_row_count": gold_df.count(),
-        "sample_rows": [row.asDict() for row in sample],
-        "suggested_org_id_for_queries": top_org["org_id"] if top_org else "org_rixa11dp",
-        "astra_configured": is_astra_configured(),
-    }
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Load Gold into AstraDB")
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Validate Gold without connecting to AstraDB",
-    )
     parser.add_argument(
         "--skip-load",
         action="store_true",
@@ -256,21 +221,9 @@ if __name__ == "__main__":
     )
     spark.sparkContext.setLogLevel("WARN")
 
-    if args.dry_run:
-        preview = dry_run_preview(spark)
-        print("DRY RUN — Gold ready to load:")
-        for key, value in preview.items():
-            if key != "sample_rows":
-                print(f"  {key}: {value}")
-        spark.stop()
-        raise SystemExit(0)
-
     if not is_astra_configured():
-        preview = dry_run_preview(spark)
-        print("Gold ready to load, but AstraDB credentials are missing:")
-        print(f"  gold_row_count: {preview['gold_row_count']}")
         print(
-            "\nSet ASTRA_DB_APPLICATION_TOKEN and "
+            "AstraDB credentials missing. Set ASTRA_DB_APPLICATION_TOKEN and "
             "ASTRA_DB_SECURE_BUNDLE_PATH (see .env.example)."
         )
         spark.stop()
