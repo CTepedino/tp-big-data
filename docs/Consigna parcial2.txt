@@ -1,0 +1,147 @@
+# Entrega del Segundo Parcial
+
+## MVP técnico
+
+### Objetivo
+
+Demostrar un **end-to-end mínimo** funcionando que conecte:
+
+```text
+Landing → Bronze → Silver → Gold → Serving (Cassandra)
+```
+
+utilizando **PySpark (Colab)** y **Structured Streaming**, cumpliendo los requisitos obligatorios del proyecto.
+
+---
+
+# Alcance mínimo requerido
+
+## 1. Batch a Bronze
+
+- Ingesta de al menos 3 maestros (por ejemplo):
+  - `customers_orgs.csv`
+  - `users.csv`
+  - `billing_monthly.csv`
+
+- Persistencia en Parquet particionado con:
+  - Tipificación explícita.
+  - Columnas técnicas:
+    - `ingest_ts`
+    - `source_file`
+  - Dedupe cuando aplique.
+
+---
+
+## 2. Streaming a Bronze
+
+Structured Streaming leyendo:
+
+```text
+usage_events_stream/*.jsonl
+```
+
+con:
+
+- Esquema explícito.
+- `withWatermark`.
+- Dedupe por `event_id`.
+- Manejo de late data.
+- Checkpointing habilitado.
+
+---
+
+## 3. Silver (mínimo)
+
+- Limpieza/conformance para eventos y 1 maestro.
+- Joins de enriquecimiento.
+- Al menos 3 features calculadas, por ejemplo:
+  - `daily_cost_usd`
+  - `requests`
+  - `genai_tokens`
+  - `carbon_kg`
+
+### Calidad de datos
+
+Implementar 3 reglas activas, por ejemplo:
+
+- `event_id` no nulo y único.
+- `cost_usd_increment >= -0.01` + flag de anomalía.
+- `unit` no nulo cuando exista `value`.
+
+Además:
+
+- Quarantine con muestras de registros rechazados.
+
+---
+
+## 4. Gold (mínimo)
+
+### Mart FinOps
+
+#### org_daily_usage_by_service
+
+Grano diario por organización y servicio con:
+
+- Métricas.
+- Costos.
+
+---
+
+## 5. Serving en Cassandra (AstraDB)
+
+- Keyspace creado.
+- 1 tabla modelada query-first para el mart anterior.
+- Carga desde Spark mediante:
+  - `foreachBatch`, o
+  - Conector Cassandra.
+
+### Evidencias
+
+Ejecutar 2 consultas mínimas del enunciado (por ejemplo #1 y #2) y adjuntar:
+
+- CQL.
+- Capturas de resultados.
+
+---
+
+## 6. Idempotencia y evidencias
+
+- Re-ejecución sin duplicar datos.
+- Mostrar conteos antes y después.
+
+### Performance
+
+- Particionado sensato.
+- Evidencias de rutas y tamaños generados.
+
+---
+
+# Artefactos a entregar
+
+- Repositorio con notebooks/código reproducible (Colab o `.py`).
+- Estructura de zonas:
+  - Bronze
+  - Silver
+  - Gold
+- Scripts CQL.
+- README (Quickstart) con pasos exactos de ejecución.
+
+Además:
+
+- Diagrama actualizado.
+- Breve log de decisiones:
+  - Patrón Lambda/Kappa.
+  - Estrategia de particionado.
+  - Claves Cassandra.
+  - Umbrales de anomalías.
+
+---
+
+# Criterios de aceptación (checklist)
+
+- [ ] Batch y streaming ejecutan correctamente con los datos provistos.
+- [ ] Reglas de calidad y quarantine funcionando con ejemplos.
+- [ ] Mart FinOps en Gold.
+- [ ] Tabla en Cassandra poblada.
+- [ ] Dos consultas sobre AstraDB ejecutadas con resultados.
+- [ ] Reprocesamiento sin duplicados (idempotencia OK).
