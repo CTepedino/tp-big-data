@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 import os
+from datetime import date, timedelta
 from typing import Any, Callable
 
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
+from pyspark.sql.window import Window
 
 from src.config import GOLD, SILVER, SPARK_TARGET_FILES_GOLD
 from src.spark.performance import configure_spark_performance, write_partitioned_parquet
+
+TOP_SERVICES_LOOKBACK_DAYS = 14
+TOP_SERVICES_TOP_N = 5
 
 USAGE_EVENTS_SILVER = os.path.join(SILVER, "usage_events")
 ORG_SERVICE_DAILY_SILVER = os.path.join(SILVER, "org_service_daily")
@@ -20,6 +25,7 @@ MARKETING_TOUCHES_SILVER = os.path.join(SILVER, "marketing_touches")
 NPS_SURVEYS_SILVER = os.path.join(SILVER, "nps_surveys")
 
 ORG_DAILY_USAGE_BY_SERVICE = os.path.join(GOLD, "org_daily_usage_by_service")
+ORG_TOP_SERVICES_BY_COST = os.path.join(GOLD, "org_top_services_by_cost")
 REVENUE_BY_ORG_MONTH = os.path.join(GOLD, "revenue_by_org_month")
 COST_ANOMALY_MART = os.path.join(GOLD, "cost_anomaly_mart")
 TICKETS_BY_ORG_DATE = os.path.join(GOLD, "tickets_by_org_date")
@@ -275,6 +281,44 @@ def build_marketing_touches_by_org_channel(
     )
 
 
+def build_org_top_services_by_cost(
+    org_daily_df: DataFrame,
+    *,
+    lookback_days: int = TOP_SERVICES_LOOKBACK_DAYS,
+    top_n: int = TOP_SERVICES_TOP_N,
+) -> DataFrame:
+    """Top-N services by cost over the last N calendar days ending at max(usage_date)."""
+    period_end = org_daily_df.agg(F.max("usage_date")).collect()[0][0]
+    if period_end is None:
+        return org_daily_df.limit(0)
+
+    if isinstance(period_end, date):
+        period_start = period_end - timedelta(days=lookback_days - 1)
+    else:
+        period_start = (
+            org_daily_df.agg(
+                F.date_sub(F.max("usage_date"), lookback_days - 1)
+            ).collect()[0][0]
+        )
+
+    in_window = org_daily_df.filter(
+        (F.col("usage_date") >= F.lit(period_start))
+        & (F.col("usage_date") <= F.lit(period_end))
+    )
+    ranked = (
+        in_window.groupBy("org_id", "service")
+        .agg(F.sum("total_daily_cost_usd").alias("accumulated_cost_usd"))
+    )
+    rank_window = Window.partitionBy("org_id").orderBy(F.desc("accumulated_cost_usd"))
+    return (
+        ranked.withColumn("rank", F.row_number().over(rank_window))
+        .filter(F.col("rank") <= top_n)
+        .withColumn("period_end", F.lit(period_end))
+        .withColumn("period_start", F.lit(period_start))
+        .withColumn("gold_ts", F.current_timestamp())
+    )
+
+
 def process_org_daily_usage_by_service(spark: SparkSession) -> dict[str, Any]:
     daily_df = spark.read.parquet(ORG_SERVICE_DAILY_SILVER)
     silver_count = daily_df.count()
@@ -296,6 +340,31 @@ def process_org_daily_usage_by_service(spark: SparkSession) -> dict[str, Any]:
             "silver_total_cost_usd": float(silver_cost or 0),
             "gold_total_cost_usd": float(gold_cost or 0),
             "cost_balance_ok": abs((silver_cost or 0) - (gold_cost or 0)) < 0.01,
+        },
+    )
+
+
+def process_org_top_services_by_cost(spark: SparkSession) -> dict[str, Any]:
+    org_daily_df = spark.read.parquet(ORG_DAILY_USAGE_BY_SERVICE)
+    gold_df = build_org_top_services_by_cost(org_daily_df)
+    written_df = _write_gold_mart(gold_df, ORG_TOP_SERVICES_BY_COST, "period_end")
+
+    period_meta = gold_df.agg(
+        F.min("period_start").alias("period_start"),
+        F.max("period_end").alias("period_end"),
+    ).collect()[0]
+
+    return _mart_result(
+        "org_top_services_by_cost",
+        ORG_TOP_SERVICES_BY_COST,
+        gold_df,
+        written_df,
+        ["org_id", "period_end", "rank", "service"],
+        extra={
+            "lookback_days": TOP_SERVICES_LOOKBACK_DAYS,
+            "top_n": TOP_SERVICES_TOP_N,
+            "period_start": str(period_meta["period_start"]),
+            "period_end": str(period_meta["period_end"]),
         },
     )
 
@@ -445,6 +514,7 @@ def process_marketing_touches_by_org_channel(spark: SparkSession) -> dict[str, A
 
 GOLD_MART_PROCESSORS: list[Callable[[SparkSession], dict[str, Any]]] = [
     process_org_daily_usage_by_service,
+    process_org_top_services_by_cost,
     process_revenue_by_org_month,
     process_cost_anomaly_mart,
     process_tickets_by_org_date,
@@ -471,6 +541,12 @@ def validate_gold(spark: SparkSession) -> dict[str, Any]:
     )
     org_daily_cost = (
         org_daily_df.agg(F.sum("total_daily_cost_usd")).collect()[0][0] or 0
+    )
+
+    top_services_df = spark.read.parquet(ORG_TOP_SERVICES_BY_COST)
+    top_services_rows = top_services_df.count()
+    top_services_grain = (
+        top_services_df.select("org_id", "period_end", "rank", "service").distinct().count()
     )
 
     revenue_df = spark.read.parquet(REVENUE_BY_ORG_MONTH)
@@ -534,6 +610,11 @@ def validate_gold(spark: SparkSession) -> dict[str, Any]:
             "silver_total_cost_usd": float(silver_cost),
             "gold_total_cost_usd": float(org_daily_cost),
             "cost_balance_ok": abs(silver_cost - org_daily_cost) < 0.01,
+        },
+        "org_top_services_by_cost": {
+            "gold_row_count": top_services_rows,
+            "distinct_grain": top_services_grain,
+            "grain_unique": top_services_rows == top_services_grain,
         },
         "revenue_by_org_month": {
             "gold_row_count": revenue_rows,

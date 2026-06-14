@@ -1,16 +1,13 @@
-"""Load Gold into AstraDB via foreachBatch and run demo queries."""
+"""Load Gold Parquet into AstraDB via foreachBatch."""
 
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 from datetime import date, datetime
 from typing import Any
 
 from pyspark.sql import DataFrame, SparkSession
-from pyspark.sql import functions as F
-from pyspark.sql.window import Window
 
 from src.cassandra.client import (
     AstraConfigError,
@@ -23,35 +20,32 @@ from src.cassandra.foreach_batch_loader import (
     load_dataframe_via_foreach_batch,
     load_parquet_via_foreach_batch,
 )
-from src.spark.performance import configure_spark_performance
-from src.cassandra.queries import (
+from src.cassandra.inserts import (
     INSERT_GENAI,
     INSERT_ORG_DAILY,
     INSERT_REVENUE,
     INSERT_TICKETS,
     INSERT_TOP_SERVICES,
-    QUERY_CRITICAL_TICKETS,
-    QUERY_DAILY_COSTS,
-    QUERY_GENAI_TOKENS_DAILY,
-    QUERY_MONTHLY_REVENUE,
-    QUERY_TOP_SERVICES,
+)
+from src.cassandra.schema import (
     TABLE_GENAI,
     TABLE_ORG_DAILY,
     TABLE_REVENUE,
     TABLE_TICKETS,
     TABLE_TOP_SERVICES,
+    TOP_SERVICES_LOOKBACK_DAYS,
 )
-from src.cassandra.queries.constants import DEFAULT_PERIOD_END, DEFAULT_PERIOD_START
 from src.config import CASSANDRA_KEYSPACE
 from src.jobs.gold import (
     GENAI_TOKENS_BY_ORG_DATE,
     ORG_DAILY_USAGE_BY_SERVICE,
+    ORG_TOP_SERVICES_BY_COST,
     REVENUE_BY_ORG_MONTH,
     TICKETS_BY_ORG_DATE,
 )
+from src.spark.performance import configure_spark_performance
 
 CQL_CREATE_TABLES = "00_create_tables.cql"
-DEFAULT_TOP_N = 5
 
 
 def _to_date(value) -> date:
@@ -103,40 +97,16 @@ def load_org_daily_usage_by_service(spark: SparkSession, session) -> dict[str, A
     )
 
 
-def build_top_services_dataframe(
-    spark: SparkSession,
-    *,
-    period_start: str = DEFAULT_PERIOD_START,
-    period_end: str = DEFAULT_PERIOD_END,
-    top_n: int = DEFAULT_TOP_N,
-) -> DataFrame:
-    start = date.fromisoformat(period_start)
-    end = date.fromisoformat(period_end)
-
-    ranked = (
-        spark.read.parquet(ORG_DAILY_USAGE_BY_SERVICE)
-        .filter(
-            (F.col("usage_date") >= F.lit(start))
-            & (F.col("usage_date") <= F.lit(end))
+def _clear_top_services_partitions(session, top_df: DataFrame) -> int:
+    """Delete Cassandra partitions before reload to avoid stale ranks."""
+    pairs = top_df.select("org_id", "period_end").distinct().collect()
+    for row in pairs:
+        session.execute(
+            f"DELETE FROM {TABLE_TOP_SERVICES} "
+            "WHERE org_id = %s AND period_end = %s",
+            (row["org_id"], _to_date(row["period_end"])),
         )
-        .groupBy("org_id", "service")
-        .agg(F.sum("total_daily_cost_usd").alias("accumulated_cost_usd"))
-    )
-    window = Window.partitionBy("org_id").orderBy(F.desc("accumulated_cost_usd"))
-    return (
-        ranked.withColumn("rank", F.row_number().over(window))
-        .filter(F.col("rank") <= top_n)
-        .withColumn("period_end", F.lit(end))
-        .withColumn("period_start", F.lit(start))
-        .select(
-            "org_id",
-            "period_end",
-            "rank",
-            "service",
-            "period_start",
-            "accumulated_cost_usd",
-        )
-    )
+    return len(pairs)
 
 
 def _top_services_params(row: dict[str, Any]) -> tuple:
@@ -150,20 +120,9 @@ def _top_services_params(row: dict[str, Any]) -> tuple:
     )
 
 
-def load_org_top_services_by_cost(
-    spark: SparkSession,
-    session,
-    *,
-    period_start: str = DEFAULT_PERIOD_START,
-    period_end: str = DEFAULT_PERIOD_END,
-    top_n: int = DEFAULT_TOP_N,
-) -> dict[str, Any]:
-    top_df = build_top_services_dataframe(
-        spark,
-        period_start=period_start,
-        period_end=period_end,
-        top_n=top_n,
-    )
+def load_org_top_services_by_cost(spark: SparkSession, session) -> dict[str, Any]:
+    top_df = spark.read.parquet(ORG_TOP_SERVICES_BY_COST)
+    deleted_partitions = _clear_top_services_partitions(session, top_df)
     result = load_dataframe_via_foreach_batch(
         spark,
         top_df,
@@ -172,7 +131,9 @@ def load_org_top_services_by_cost(
         row_to_params=_top_services_params,
         session=session,
     )
-    result["gold_path"] = ORG_DAILY_USAGE_BY_SERVICE
+    result["gold_path"] = ORG_TOP_SERVICES_BY_COST
+    result["deleted_partitions"] = deleted_partitions
+    result["lookback_days"] = TOP_SERVICES_LOOKBACK_DAYS
     return result
 
 
@@ -257,89 +218,13 @@ def load_all_gold_marts(spark: SparkSession, session) -> list[dict[str, Any]]:
     return [loader(spark, session) for loader in loaders]
 
 
-def run_query_daily_costs_and_requests(
-    session,
-    *,
-    org_id: str = "org_rixa11dp",
-    start_date: str = "2025-07-01",
-    end_date: str = "2025-08-31",
-) -> list[dict[str, Any]]:
-    rows = session.execute(
-        QUERY_DAILY_COSTS,
-        (org_id, date.fromisoformat(start_date), date.fromisoformat(end_date)),
-    )
-    return [dict(row._asdict()) for row in rows]
-
-
-def run_query_top_services_by_cost(
-    session,
-    *,
-    org_id: str = "org_rixa11dp",
-    period_end: str = DEFAULT_PERIOD_END,
-    top_n: int = DEFAULT_TOP_N,
-) -> list[dict[str, Any]]:
-    rows = session.execute(
-        QUERY_TOP_SERVICES,
-        (org_id, date.fromisoformat(period_end), top_n),
-    )
-    return [dict(row._asdict()) for row in rows]
-
-
-def run_query_critical_tickets_sla(
-    session,
-    *,
-    org_id: str = "org_rixa11dp",
-    severity: str = "high",
-    start_date: str = "2025-08-01",
-    end_date: str = "2025-08-31",
-) -> list[dict[str, Any]]:
-    rows = session.execute(
-        QUERY_CRITICAL_TICKETS,
-        (
-            org_id,
-            severity,
-            date.fromisoformat(start_date),
-            date.fromisoformat(end_date),
-        ),
-    )
-    return [dict(row._asdict()) for row in rows]
-
-
-def run_query_monthly_revenue(
-    session,
-    *,
-    org_id: str = "org_rixa11dp",
-    start_month: str = "2025-06-01",
-    end_month: str = "2025-08-01",
-) -> list[dict[str, Any]]:
-    rows = session.execute(
-        QUERY_MONTHLY_REVENUE,
-        (org_id, date.fromisoformat(start_month), date.fromisoformat(end_month)),
-    )
-    return [dict(row._asdict()) for row in rows]
-
-
-def run_query_genai_tokens_daily(
-    session,
-    *,
-    org_id: str = "org_rixa11dp",
-    start_date: str = "2025-08-01",
-    end_date: str = "2025-08-31",
-) -> list[dict[str, Any]]:
-    rows = session.execute(
-        QUERY_GENAI_TOKENS_DAILY,
-        (org_id, date.fromisoformat(start_date), date.fromisoformat(end_date)),
-    )
-    return [dict(row._asdict()) for row in rows]
-
-
 def run_serving(
     spark: SparkSession,
     *,
     setup_ddl: bool = True,
     skip_load: bool = False,
-    org_id: str = "org_rixa11dp",
 ) -> dict[str, Any]:
+    """DDL + Gold load only. Demo queries live in src.cassandra.demo (notebook §7)."""
     session, cluster = get_cassandra_session()
     try:
         if setup_ddl:
@@ -352,23 +237,7 @@ def run_serving(
         else:
             print("  Load skipped (--skip-load).")
 
-        query1 = run_query_daily_costs_and_requests(session, org_id=org_id)
-        query3 = run_query_critical_tickets_sla(session, org_id=org_id)
-        query4 = run_query_monthly_revenue(session, org_id=org_id)
-        query5 = run_query_genai_tokens_daily(session, org_id=org_id)
-
-        return {
-            "load": load_results,
-            "query1_rows": len(query1),
-            "query1_sample": query1[:5],
-            "query2_top": run_query_top_services_by_cost(session, org_id=org_id),
-            "query3_rows": len(query3),
-            "query3_sample": query3[:5],
-            "query4_rows": len(query4),
-            "query4_sample": query4,
-            "query5_rows": len(query5),
-            "query5_sample": query5[:5],
-        }
+        return {"load": load_results}
     finally:
         cluster.shutdown()
 
@@ -380,7 +249,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--skip-load",
         action="store_true",
-        help="Run DDL and queries only; skip Gold load",
+        help="Run DDL only; skip Gold load",
+    )
+    parser.add_argument(
+        "--demo-queries",
+        action="store_true",
+        help="After load, run demo CQL selects (see src.cassandra.demo)",
     )
     args = parser.parse_args()
 
@@ -405,15 +279,33 @@ if __name__ == "__main__":
         if result["load"]:
             for load_result in result["load"]:
                 print(f"LOAD {load_result['table_name']}: {load_result}")
-        print(f"QUERY #1 rows: {result['query1_rows']}")
-        print("QUERY #1 sample:", result["query1_sample"])
-        print("QUERY #2 top:", result["query2_top"])
-        print(f"QUERY #3 rows: {result['query3_rows']}")
-        print("QUERY #3 sample:", result["query3_sample"])
-        print(f"QUERY #4 rows: {result['query4_rows']}")
-        print("QUERY #4 sample:", result["query4_sample"])
-        print(f"QUERY #5 rows: {result['query5_rows']}")
-        print("QUERY #5 sample:", result["query5_sample"])
+
+        if args.demo_queries:
+            from src.cassandra.demo import close_demo_session, open_demo_session, run_cql_select
+            from src.cassandra.selects import (
+                critical_tickets_sla,
+                daily_costs_and_requests,
+                genai_tokens_daily,
+                monthly_revenue,
+                top_services_by_cost,
+            )
+
+            demo = open_demo_session(spark)
+            if demo is None:
+                print("Demo queries skipped (Astra not configured).")
+            else:
+                p = demo.params
+                print(f"DEMO org_id={p.org_id}")
+                for label, query in [
+                    ("#1", daily_costs_and_requests(p.org_id, p.q1_start, p.q1_end)),
+                    ("#2", top_services_by_cost(p.org_id, p.period_end, p.top_n)),
+                    ("#3", critical_tickets_sla(p.org_id, p.q3_severity, p.q3_start, p.q3_end)),
+                    ("#4", monthly_revenue(p.org_id, p.q4_start, p.q4_end)),
+                    ("#5", genai_tokens_daily(p.org_id, p.q5_start, p.q5_end)),
+                ]:
+                    rows = run_cql_select(demo.session, query)
+                    print(f"QUERY {label}: {len(rows)} rows")
+                close_demo_session(demo)
     except AstraConfigError as exc:
         print(f"ERROR: {exc}")
         raise SystemExit(1) from exc

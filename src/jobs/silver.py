@@ -19,10 +19,21 @@ from src.config import (
     SPARK_TARGET_FILES_MASTER,
 )
 from src.spark.performance import configure_spark_performance, write_partitioned_parquet
+from src.schemas.normalization import (
+    invalid_region_condition,
+    invalid_service_condition,
+    normalize_column_expr,
+    normalized_event_ts,
+    normalized_region,
+    normalized_service,
+    normalized_string,
+)
 from src.schemas.silver import (
+    COST_USD_INCREMENT_MIN,
     FUTURE_EVENT_TOLERANCE_SEC,
     MAD_MIN_FLOOR,
     MAD_THRESHOLD,
+    P99_ANOMALY_MULTIPLIER,
     PERCENTILE_HIGH,
     PERCENTILE_LOW,
     QUARANTINE_REASONS,
@@ -112,11 +123,15 @@ def _add_quarantine_metadata(df: DataFrame, error_reason: str) -> DataFrame:
     )
 
 
-def _trim_columns(df: DataFrame, columns: list[str]) -> DataFrame:
+def _normalize_columns(df: DataFrame, columns: list[str]) -> DataFrame:
     for column in columns:
         if column in df.columns:
-            df = df.withColumn(column, F.trim(F.col(column)))
+            df = df.withColumn(column, normalize_column_expr(column))
     return df
+
+
+def _trim_columns(df: DataFrame, columns: list[str]) -> DataFrame:
+    return _normalize_columns(df, columns)
 
 
 def _null_primary_key_condition(primary_keys: list[str]) -> Any:
@@ -275,10 +290,16 @@ def _add_cost_anomaly_flags(df: DataFrame) -> DataFrame:
             | (F.col("cost_usd_increment") > F.col("_p99")),
         )
         .withColumn(
+            "is_cost_anomaly_p99_x",
+            F.col("cost_usd_increment")
+            > (F.col("_p99") * F.lit(P99_ANOMALY_MULTIPLIER)),
+        )
+        .withColumn(
             "is_cost_anomaly",
             F.col("is_cost_anomaly_zscore")
             | F.col("is_cost_anomaly_mad")
-            | F.col("is_cost_anomaly_percentile"),
+            | F.col("is_cost_anomaly_percentile")
+            | F.col("is_cost_anomaly_p99_x"),
         )
         .drop(
             "_mean_cost",
@@ -291,6 +312,22 @@ def _add_cost_anomaly_flags(df: DataFrame) -> DataFrame:
             "_zscore",
             "_modified_z",
         )
+    )
+
+
+def _normalize_usage_event_dimensions(df: DataFrame) -> DataFrame:
+    """Conformance: lower/trim, catalog aliases, prefer resource maestro for service/region."""
+    return (
+        df.withColumn("event_ts", normalized_event_ts(F.col("event_ts")))
+        .withColumn("service", normalized_service(F.col("service")))
+        .withColumn("region", normalized_region(F.col("region")))
+        .withColumn("metric", normalized_string(F.col("metric")))
+        .withColumn("unit", normalized_string(F.col("unit")))
+        .withColumn("resource_service", normalized_service(F.col("resource_service")))
+        .withColumn("resource_region", normalized_region(F.col("resource_region")))
+        .withColumn("org_hq_region", normalized_region(F.col("org_hq_region")))
+        .withColumn("service", F.coalesce(F.col("resource_service"), F.col("service")))
+        .withColumn("region", F.coalesce(F.col("resource_region"), F.col("region")))
     )
 
 
@@ -322,6 +359,7 @@ def _enrich_usage_events(
         .join(broadcast(resources), on="resource_id", how="left")
         .join(broadcast(org_user_stats_df), on="org_id", how="left")
     )
+    enriched = _normalize_usage_event_dimensions(enriched)
 
     enriched = (
         enriched.withColumn("usage_date", F.to_date("event_ts"))
@@ -378,6 +416,12 @@ def _future_event_ts_condition() -> Any:
     )
 
 
+def _cost_below_minimum_condition() -> Any:
+    return F.col("cost_usd_increment").isNotNull() & (
+        F.col("cost_usd_increment") < F.lit(COST_USD_INCREMENT_MIN)
+    )
+
+
 def _split_valid_and_quarantine(enriched_df: DataFrame) -> tuple[DataFrame, DataFrame]:
     quarantine_parts: list[DataFrame] = []
 
@@ -418,9 +462,45 @@ def _split_valid_and_quarantine(enriched_df: DataFrame) -> tuple[DataFrame, Data
             )
         )
 
+    negative_cost = deduped.filter(_cost_below_minimum_condition())
+    if negative_cost.head(1):
+        quarantine_parts.append(
+            _add_quarantine_metadata(
+                negative_cost, QUARANTINE_REASONS["cost_below_minimum"]
+            )
+        )
+
+    null_event_ts = deduped.filter(F.col("event_ts").isNull())
+    if null_event_ts.head(1):
+        quarantine_parts.append(
+            _add_quarantine_metadata(
+                null_event_ts, QUARANTINE_REASONS["null_event_ts"]
+            )
+        )
+
+    invalid_service = deduped.filter(invalid_service_condition())
+    if invalid_service.head(1):
+        quarantine_parts.append(
+            _add_quarantine_metadata(
+                invalid_service, QUARANTINE_REASONS["invalid_service"]
+            )
+        )
+
+    invalid_region = deduped.filter(invalid_region_condition())
+    if invalid_region.head(1):
+        quarantine_parts.append(
+            _add_quarantine_metadata(
+                invalid_region, QUARANTINE_REASONS["invalid_region"]
+            )
+        )
+
     orphans_org = deduped.filter(
         F.col("org_name").isNull()
         & ~(F.col("value").isNotNull() & F.col("unit").isNull())
+        & ~_cost_below_minimum_condition()
+        & F.col("event_ts").isNotNull()
+        & ~invalid_service_condition()
+        & ~invalid_region_condition()
     )
     if orphans_org.head(1):
         quarantine_parts.append(
@@ -432,6 +512,10 @@ def _split_valid_and_quarantine(enriched_df: DataFrame) -> tuple[DataFrame, Data
         & F.col("resource_service").isNull()
         & F.col("org_name").isNotNull()
         & ~(F.col("value").isNotNull() & F.col("unit").isNull())
+        & ~_cost_below_minimum_condition()
+        & F.col("event_ts").isNotNull()
+        & ~invalid_service_condition()
+        & ~invalid_region_condition()
     )
     if orphans_resource.head(1):
         quarantine_parts.append(
@@ -462,11 +546,15 @@ def _split_valid_and_quarantine(enriched_df: DataFrame) -> tuple[DataFrame, Data
 
     valid_df = deduped.filter(
         F.col("org_name").isNotNull()
+        & F.col("event_ts").isNotNull()
+        & ~invalid_service_condition()
+        & ~invalid_region_condition()
         & (
             F.col("resource_id").isNull()
             | F.col("resource_service").isNotNull()
         )
         & ~(F.col("value").isNotNull() & F.col("unit").isNull())
+        & ~_cost_below_minimum_condition()
         & (
             F.col("event_latency_sec").isNull()
             | (F.col("event_latency_sec") <= F.lit(LATE_CATCHUP_MAX_SEC))
@@ -554,6 +642,28 @@ def process_usage_events_silver(spark: SparkSession) -> dict[str, Any]:
         "cost_anomalies_percentile": valid_df.filter(
             F.col("is_cost_anomaly_percentile")
         ).count(),
+        "cost_anomalies_p99_x": valid_df.filter(F.col("is_cost_anomaly_p99_x")).count(),
+        "negative_cost_quarantined": (
+            quarantine_df.filter(
+                F.col("error_reason") == QUARANTINE_REASONS["cost_below_minimum"]
+            ).count()
+            if quarantine_count > 0
+            else 0
+        ),
+        "invalid_service_quarantined": (
+            quarantine_df.filter(
+                F.col("error_reason") == QUARANTINE_REASONS["invalid_service"]
+            ).count()
+            if quarantine_count > 0
+            else 0
+        ),
+        "invalid_region_quarantined": (
+            quarantine_df.filter(
+                F.col("error_reason") == QUARANTINE_REASONS["invalid_region"]
+            ).count()
+            if quarantine_count > 0
+            else 0
+        ),
         "late_arrivals_flagged": valid_df.filter(F.col("is_late_arrival")).count(),
         "late_arrivals_quarantined": (
             quarantine_df.filter(
@@ -648,6 +758,7 @@ def validate_silver(spark: SparkSession) -> dict[str, Any]:
         "is_cost_anomaly_zscore",
         "is_cost_anomaly_mad",
         "is_cost_anomaly_percentile",
+        "is_cost_anomaly_p99_x",
     }
     missing_features = sorted(required_features - set(events_silver.columns))
 

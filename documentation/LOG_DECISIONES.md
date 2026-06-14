@@ -2,7 +2,7 @@
 
 Documento vivo que registra las decisiones de diseño e implementación del proyecto **Cloud Provider Analytics**. Se actualiza a medida que avanza el MVP del segundo parcial.
 
-**Última actualización:** 2026-06-13
+**Última actualización:** 2026-06-13 (reglas `cost_usd_increment`, normalización conformance)
 
 ---
 
@@ -62,6 +62,7 @@ Documento vivo que registra las decisiones de diseño e implementación del proy
 | **Late data (replay)** | `ingest_ts = event_ts` cuando watermark ≠ producción | Evita falsos late al replay del landing estático con `current_timestamp()` |
 | **Late data (producción)** | `ingest_ts = current_timestamp()` | Latencia real ingest − evento |
 | **Dedupe** | `dropDuplicates(["event_id"])` post-watermark | Requisito consigna; estado acotado por watermark |
+| **Normalización temprana** | `service`, `region`, `metric`, `unit`: trim + lower + aliases (`src/schemas/normalization.py`) | Conformance antes de materializar Bronze; alineado a Silver |
 | **Checkpoint** | `checkpoints/usage_events_bronze/` | Exactly-once lógico y reanudación |
 | **Trigger desarrollo** | `availableNow=True` + `maxFilesPerTrigger=20` | Procesa todo el landing en corrida reproducible |
 | **Particionado salida** | `partitionBy("ingest_date")` | Consistente con batch Bronze |
@@ -76,10 +77,11 @@ Documento vivo que registra las decisiones de diseño e implementación del proy
 | Tema | Decisión | Motivo |
 |---|---|---|
 | **Alcance** | 7 maestros + `usage_events` | Bronze batch completo + streaming materializado |
-| **Motor** | Job batch PySpark sobre Parquet Bronze | Bronze streaming ya materializado; Silver corre como batch idempotente |
+| **Motor** | Job batch PySpark sobre Parquet Bronze | Bronze streaming ya materializado; Silver corre como batch idempotente (Lambda) |
 | **Orden de ejecución** | Maestros (`customers_orgs` primero) → `usage_events` | Joins de eventos dependen de maestros Silver |
-| **Maestros** | Trim, `silver_ts`, quarantine por PK nula u `org_id` huérfano | Conformance sin perder trazabilidad |
+| **Maestros** | Normalización conformance + `silver_ts`; quarantine por PK nula u `org_id` huérfano | Ver §12; ya no solo `trim` |
 | **Join eventos** | `customers_orgs`, `resources`, stats de `users` por `org_id` | Enriquecimiento org + recurso + adopción de usuarios |
+| **Canonical service/region** | Tras join: `coalesce(resource_*, evento)` con catálogo normalizado | Maestro `resources` gana si el evento trae ruido |
 | **Features evento** | `usage_date`, `cost_usd_increment`, `requests`, `cpu_hours`, `storage_gb_hours`, `genai_tokens`, `carbon_kg` | Grano evento para anomalías, late data y quarantine |
 | **Features agregadas** | `silver/org_service_daily` grano `(org_id, usage_date, service)` con `daily_cost_usd` | Consigna completa: `daily_cost_usd` por org y servicio |
 | **Schema v1/v2** | `coalesce(genai_tokens, 0)`, `coalesce(carbon_kg, 0)` | No romper métricas históricas sin campos v2 |
@@ -87,13 +89,16 @@ Documento vivo que registra las decisiones de diseño e implementación del proy
 | **Regla 2** | `value` presente y `unit` nulo → quarantine | Conformance de métricas |
 | **Regla 3** | `org_id` o `resource_id` sin match en maestro → quarantine | Integridad referencial |
 | **Regla 4** | `event_latency_sec > 1800` (30 min) → quarantine | Late extremo aislado; late suave (10–30 min) sigue en Silver con `is_late_arrival` |
-| **Regla 5** | `event_ts > now() + 5 min` → quarantine | Fechas futuras inválidas aisladas (`FUTURE_EVENT_TOLERANCE_SEC`) |
-| **Anomalías costo** | 3 métodos consigna: Z-score (`|z|>3`), MAD modificado (`|z_mad|>3.5`), percentiles (P1/P99) | `is_cost_anomaly` = OR de los 3 flags; no quarantine |
+| **Regla 5** | `event_ts > now() + 5 min` → quarantine | Fechas futuras inválidas (`FUTURE_EVENT_TOLERANCE_SEC`) |
+| **Regla 6** | `cost_usd_increment < -0.01` → quarantine | Consigna: dominio `[-0.01, +∞)`; no mezclar con flag de anomalía |
+| **Regla 7** | `event_ts` nulo o no parseable → quarantine | Fechas inválidas tras `to_timestamp` |
+| **Regla 8** | `service` / `region` fuera de catálogo cloud → quarantine | Solo si valor no nulo tras normalizar; defensivo ante landing ruidoso |
+| **Anomalías costo** | Z-score (`|z|>3`), MAD (`|z_mad|>3.5`), percentiles (P1/P99), **p99×X** (`X=2.0`) | `is_cost_anomaly` = OR de los 4 flags; **no** quarantine |
 | **Quarantine** | `quarantine/silver/<dataset>/` con `error_reason`, `quarantine_ts` | No bloquea el pipeline principal |
 | **Particionado Silver** | `usage_date` (eventos), `ingest_date` (maestros) | Consultas por rango temporal en Gold |
 | **Modo escritura** | `overwrite` | Idempotencia en re-ejecución |
 
-**Conteos validados (2026-06-13):** Bronze 43.200 → Silver 41.162 + Quarantine 2.038; maestros 80/800/240/400/1000/1500/92 sin pérdida; balance OK.
+**Conteos validados (2026-06-13):** Bronze 43.200 → Silver **40.956** válidos + Quarantine **2.249** (2.244 `event_id` únicos en quarantine por union multi-regla); maestros 80/800/240/400/1000/1500/92 sin pérdida. Desglose quarantine eventos: ~211 costo < −0.01; 0 servicio/región inválidos en dataset demo. Ver §12 normalización.
 
 ---
 
@@ -104,6 +109,7 @@ Documento vivo que registra las decisiones de diseño e implementación del proy
 | **Marts servidos (5)** | Tablas Astra alineadas a consultas #1–#5 | Query-first; obligatorio para demo CQL |
 | **Marts Gold-only (3)** | `cost_anomaly_mart`, `nps_by_org_date`, `marketing_touches_by_org_channel` | Analítica en Parquet; consigna §4 Gold / maestros CRM sin consulta CQL mínima |
 | **org_daily_usage_by_service** | Grano `(org_id, usage_date, service)` | Consulta #1 FinOps diaria · **servido** |
+| **org_top_services_by_cost** | Grano `(org_id, period_end, rank, service)` · ventana rolling 14d hasta `max(usage_date)` | Consulta #2 · **servido** |
 | **revenue_by_org_month** | Grano `(org_id, billing_month)` con `invoice_count` y montos USD | Consulta #4 · **servido** |
 | **cost_anomaly_mart** | Grano `(org_id, usage_date, service)` + `anomaly_score` | FinOps interno; **no servido** (no es consulta #1–#5) |
 | **tickets_by_org_date** | Grano `(org_id, ticket_date, severity)` | Consulta #3 · **servido** |
@@ -113,11 +119,11 @@ Documento vivo que registra las decisiones de diseño e implementación del proy
 | **Fuente principal** | `silver/org_service_daily` (FinOps diario), `silver/usage_events` (anomalías/GenAI) + maestros | Grano correcto por capa |
 | **Métricas usage** | costo, requests, cpu_hours, storage_gb_hours, genai, carbon | Features Silver agregadas |
 | **Revenue FX** | `amount * exchange_rate_to_usd` | Normalización multi-moneda |
-| **Particionado** | `usage_date`, `billing_month`, `ticket_date` | Lecturas por rango temporal |
+| **Particionado** | `usage_date`, `billing_month`, `ticket_date`, `period_end` | Lecturas por rango temporal |
 | **Modo escritura** | `overwrite` | Idempotencia en re-ejecución |
 | **Validación** | Grano único + balances costo/tickets/tokens | Integridad entre capas |
 
-**Conteos validados (2026-06-13):** servidos — `org_daily_usage_by_service` 12.114; `revenue_by_org_month` 240; `tickets_by_org_date` 984; `genai_tokens_by_org_date` 1.235. Gold-only — `cost_anomaly_mart` 12.114 (6.416 con flag); `nps_by_org_date` 92; `marketing_touches_by_org_channel` 1.477.
+**Conteos validados (2026-06-13):** servidos — `org_daily_usage_by_service` **12.108**; `revenue_by_org_month` 240; `tickets_by_org_date` 984; `genai_tokens_by_org_date` 1.235. Gold-only — `cost_anomaly_mart` 12.108 (**6.351** con flag); `nps_by_org_date` 92; `marketing_touches_by_org_channel` 1.477.
 
 ---
 
@@ -128,21 +134,21 @@ Documento vivo que registra las decisiones de diseño e implementación del proy
 | **Keyspace** | `cloud_analytics` | Convención del enunciado |
 | **Tablas (5)** | Una por consulta mínima del enunciado | Modelo query-first; marts Gold adicionales quedan en Parquet |
 | **org_daily_usage_by_service** | PK `((org_id), usage_date, service)` | Consulta #1 |
-| **org_top_services_by_cost** | PK `((org_id, period_end), rank, service)` | Consulta #2 en CQL puro (pre-agregado en carga) |
+| **org_top_services_by_cost** | PK `((org_id, period_end), rank, service)` | Consulta #2 en CQL puro (mart Gold + carga Serving) |
 | **tickets_by_org_date** | PK `((org_id, severity), ticket_date)` | Consulta #3 tickets críticos + SLA por rango |
 | **Consulta #3 — tickets críticos** | Filtro `severity = 'high'` | El landing solo define `low` / `medium` / `high` (sin `critical`); se mapea *crítico* → `high` como máxima severidad disponible |
 | **revenue_by_org_month** | PK `((org_id), billing_month)` | Consulta #4 revenue USD agregado por mes |
 | **genai_tokens_by_org_date** | PK `((org_id), usage_date)` | Consulta #5 tokens y costo estimado |
 | **Keyspace en Astra** | Crear `cloud_analytics` en consola (no vía CQL) | Astra bloquea `CREATE KEYSPACE` por driver |
 | **Carga** | Structured Streaming `foreachBatch` sobre Gold Parquet → prepared INSERT (driver dentro de cada micro-batch) | Cumple consigna §5 (`foreachBatch` + driver Python); consultas demo siguen con `cassandra-driver` |
-| **Top-N (#2)** | Pre-cálculo en job Serving (ventana 14 días demo) | Evita agregación en app; rank materializado |
+| **Top-N (#2)** | Mart Gold `org_top_services_by_cost`: ventana rolling 14 días anclada a `max(usage_date)`; Serving carga Parquet (DELETE partition + INSERT) | Evita agregación en app; rank materializado; ventana sigue al último dato del lake |
 | **Revenue (#4)** | Carga directa desde Gold `(org_id, billing_month)` | Mismo grano que Cassandra; sin re-agregar en Serving |
-| **Idempotencia** | Upsert implícito por PK (re-INSERT sobrescribe) | Re-cargar Gold no duplica |
+| **Idempotencia** | Upsert implícito por PK; top-N: DELETE `(org_id, period_end)` antes de INSERT | Re-cargar Gold no duplica; ranks obsoletos no persisten |
 | **DDL** | `cql/00_create_tables.cql` | 5 tablas query-first |
 | **Credenciales** | `ASTRA_DB_APPLICATION_TOKEN` + `ASTRA_DB_SECURE_BUNDLE_PATH` | Solo AstraDB vía `cassandra-driver` |
 | **TTL** | Sin TTL | Agregados analíticos deben persistir |
 
-**Scripts:** `cql/00`–`05` · **Job:** `src/jobs/serving_cassandra.py` · **Notebook:** `pipeline.ipynb`
+**Scripts:** `cql/00`–`05` · **Carga:** `src/jobs/serving_cassandra.py` · **Consultas demo:** `src/cassandra/selects.py` + `demo.py` · **Notebook:** `pipeline.ipynb` §7
 
 ---
 
@@ -172,6 +178,11 @@ Documento vivo que registra las decisiones de diseño e implementación del proy
 | Late arrival (negocio) | `600` segundos | Flag `is_late_arrival` en Bronze/Silver válido | `LATE_DATA_THRESHOLD_SEC` |
 | Retraso máximo catch-up | `1800` segundos (30 min) | Quarantine Silver si supera umbral | `LATE_CATCHUP_MAX_SEC` |
 | Fecha futura inválida | `300` segundos (5 min) | Quarantine Silver si `event_ts` supera tolerancia | `FUTURE_EVENT_TOLERANCE_SEC` |
+| Costo mínimo válido | `-0.01` USD | Quarantine Silver si `cost_usd_increment` menor | `COST_USD_INCREMENT_MIN` |
+| Anomalía p99×X | `X = 2.0` | Flag `is_cost_anomaly_p99_x` si costo > p99×X por org/servicio | `P99_ANOMALY_MULTIPLIER` |
+| Z-score costo | `3.0` | Flag `is_cost_anomaly_zscore` | `ZSCORE_THRESHOLD` |
+| MAD modificado | `3.5` | Flag `is_cost_anomaly_mad` | `MAD_THRESHOLD` |
+| Percentiles costo | P1 / P99 | Flag `is_cost_anomaly_percentile` | `PERCENTILE_LOW` / `PERCENTILE_HIGH` |
 | Trigger streaming dev | `availableNow` | Notebooks / corridas locales | Código job |
 | `maxFilesPerTrigger` | `20` | Bronze streaming | Código job |
 
@@ -184,7 +195,7 @@ Documento vivo que registra las decisiones de diseño e implementación del proy
 | **Bronze batch** | `overwrite` + dedupe por clave natural antes de escribir |
 | **Bronze streaming** | Checkpoint + dedupe `event_id`; re-ejecución sin `reset_state` no duplica |
 | **Reset desarrollo** | `reset_streaming_state()` borra `bronze/usage_events/` y checkpoint para corrida limpia |
-| **Silver/Gold** | Silver: `overwrite` por dataset; balance `bronze = silver + quarantine` |
+| **Silver/Gold** | Silver: `overwrite` por dataset; balance `bronze ≈ silver válido + quarantine` (union multi-regla puede contar filas duplicadas en stats) |
 | **Cassandra** | Upsert por PK `(org_id, usage_date, service)` vía prepared INSERT |
 
 ---
@@ -194,9 +205,27 @@ Documento vivo que registra las decisiones de diseño e implementación del proy
 | Decisión | Detalle |
 |---|---|
 | **Runtime** | Google Colab + ejecución local con `.venv` |
-| **Módulos** | Lógica en `src/`; orquestación y evidencias en `notebooks/pipeline_completo.ipynb` |
+| **Módulos** | Lógica en `src/`; orquestación y evidencias en `notebooks/pipeline.ipynb` |
 | **Spark** | `local[*]` en desarrollo; PySpark ≥ 3.5 |
 | **Dependencias** | `requirements.txt` en raíz del repo |
+
+---
+
+## 12. Normalización y conformance (§3 consigna)
+
+| Tema | Decisión | Motivo |
+|---|---|---|
+| **Módulo** | `src/schemas/normalization.py` | Reglas reutilizables Bronze + Silver |
+| **Strings** | `trim` + `lower`; `""` → `null` | Categóricos comparables en joins y agregaciones |
+| **Regiones** | Además `_` → `-` (ej. `us_east` → `us-east`) | Alias geográfico sin tabla externa |
+| **Servicios** | Mapa de aliases (`computing`→`compute`, `ai`→`genai`, …) | Tolerar sinónimos del landing |
+| **Catálogo** | 6 servicios + 7 regiones del challenge | Quarantine si valor no nulo y fuera de lista |
+| **Maestros Silver** | Mismas reglas en columnas de texto (`hq_region`, `service`, `channel`, …) | Conformance homogéneo batch/stream |
+| **Eventos** | Normalización en Bronze streaming + Silver post-join | Doble capa: temprana en ingesta, canonical con maestro en Silver |
+| **Fechas evento** | `event_ts` vía `to_timestamp`; `usage_date = to_date(event_ts)` | Silver rechaza timestamps no parseables |
+| **Agregación diaria** | En batch Silver/Gold, no ventana tumbling en stream | Lambda: near-RT en ingesta; métricas diarias en convergencia batch |
+
+**Nota streaming “ventanas”:** watermark = ventana de event-time para late data; agregaciones por intervalo (10 min) no implementadas en stream — grano diario en `org_service_daily` / Gold.
 
 ---
 
@@ -215,9 +244,13 @@ Documento vivo que registra las decisiones de diseño e implementación del proy
 | 2026-06-13 | Reglas calidad Silver completas: catch-up 30 min + fecha futura 5 min en quarantine. |
 | 2026-06-13 | Gold `revenue_by_org_month` alineado a grano `(org_id, billing_month)`; Serving carga directa. |
 | 2026-06-13 | Marts Gold-only: `nps_by_org_date`, `marketing_touches_by_org_channel`; `cost_anomaly_mart` documentado sin Serving. |
+| 2026-06-13 | Regla consigna `cost_usd_increment ≥ -0.01` → quarantine; flag `is_cost_anomaly_p99_x` (p99×2) sumado al OR de anomalías. |
+| 2026-06-13 | Normalización conformance: `src/schemas/normalization.py`; Bronze streaming + Silver maestros/eventos; catálogo servicio/región. |
+| 2026-06-13 | Silver/Gold re-ejecutados tras reglas de costo y normalización (40.956 válidos; Gold FinOps 12.108 filas). |
 
 ---
 
 ## Próximas entradas esperadas
 
 - [ ] Capturas de consultas AstraDB en notebook (requiere credenciales).
+- [ ] Re-ejecutar Bronze streaming tras normalización temprana si se requiere Parquet Bronze regenerado desde landing.

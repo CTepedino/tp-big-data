@@ -32,7 +32,7 @@ cloud-provider-analytics/
 ├── src/
 │   ├── jobs/               # modulos de cada capa y serving
 │   ├── schemas/        
-│   └── cassandra/          # cliente AstraDB + queries parametrizadas
+│   └── cassandra/          # cliente AstraDB, inserts, selects y demo CQL
 ├── docs/                   # consigna, log de decisiones
 └── requirements.txt
 ```

@@ -28,6 +28,11 @@ from src.schemas.bronze_streaming import (
     WATERMARK_DELAY,
     WATERMARK_DELAY_PRODUCTION,
 )
+from src.schemas.normalization import (
+    normalized_region,
+    normalized_service,
+    normalized_string,
+)
 
 USAGE_EVENTS_LANDING_GLOB = os.path.join(LANDING, "usage_events_stream", "*.jsonl")
 USAGE_EVENTS_BRONZE_PATH = os.path.join(BRONZE, "usage_events")
@@ -61,6 +66,10 @@ def _ingest_ts_column() -> Column:
 def transform_usage_events_bronze(df: DataFrame) -> DataFrame:
     df = (
         df.withColumn("event_ts", F.to_timestamp("timestamp"))
+        .withColumn("service", normalized_service(F.col("service")))
+        .withColumn("region", normalized_region(F.col("region")))
+        .withColumn("metric", normalized_string(F.col("metric")))
+        .withColumn("unit", normalized_string(F.col("unit")))
         .withColumn("value_numeric", _parse_event_value())
         .drop("value")
         .withColumnRenamed("value_numeric", "value")
