@@ -123,7 +123,7 @@ Documento vivo que registra las decisiones de diseño e implementación del proy
 | **Modo escritura** | `overwrite` | Idempotencia en re-ejecución |
 | **Validación** | Grano único + balances costo/tickets/tokens | Integridad entre capas |
 
-**Conteos validados (2026-06-13):** servidos — `org_daily_usage_by_service` **12.108**; `revenue_by_org_month` 240; `tickets_by_org_date` 984; `genai_tokens_by_org_date` 1.235. Gold-only — `cost_anomaly_mart` 12.108 (**6.351** con flag); `nps_by_org_date` 92; `marketing_touches_by_org_channel` 1.477.
+**Conteos validados (2026-06-13, corrida limpia):** Bronze eventos 43.200 → Silver **40.956** válidos + **2.249** quarantine; Gold FinOps **12.108**; `org_top_services_by_cost` 258; `revenue_by_org_month` 240; `tickets_by_org_date` 984; `genai_tokens_by_org_date` 1.235. Gold-only — `cost_anomaly_mart` 12.108 (**6.351** con flag); `nps_by_org_date` 92; `marketing_touches_by_org_channel` 1.477.
 
 ---
 
@@ -142,6 +142,7 @@ Documento vivo que registra las decisiones de diseño e implementación del proy
 | **Keyspace en Astra** | Crear `cloud_analytics` en consola (no vía CQL) | Astra bloquea `CREATE KEYSPACE` por driver |
 | **Carga** | Structured Streaming `foreachBatch` sobre Gold Parquet → prepared INSERT (driver dentro de cada micro-batch) | Cumple consigna §5 (`foreachBatch` + driver Python); consultas demo siguen con `cassandra-driver` |
 | **Top-N (#2)** | Mart Gold `org_top_services_by_cost`: ventana rolling 14 días anclada a `max(usage_date)`; Serving carga Parquet (DELETE partition + INSERT) | Evita agregación en app; rank materializado; ventana sigue al último dato del lake |
+| **Tickets (#3)** | Ventana demo rolling 30 días hasta `max(ticket_date)` por org + `severity=high` (`TICKETS_CRITICAL_LOOKBACK_DAYS`) | Alineado a consigna “últimos 30 días” |
 | **Revenue (#4)** | Carga directa desde Gold `(org_id, billing_month)` | Mismo grano que Cassandra; sin re-agregar en Serving |
 | **Idempotencia** | Upsert implícito por PK; top-N: DELETE `(org_id, period_end)` antes de INSERT | Re-cargar Gold no duplica; ranks obsoletos no persisten |
 | **DDL** | `cql/00_create_tables.cql` | 5 tablas query-first |
@@ -246,11 +247,10 @@ Documento vivo que registra las decisiones de diseño e implementación del proy
 | 2026-06-13 | Marts Gold-only: `nps_by_org_date`, `marketing_touches_by_org_channel`; `cost_anomaly_mart` documentado sin Serving. |
 | 2026-06-13 | Regla consigna `cost_usd_increment ≥ -0.01` → quarantine; flag `is_cost_anomaly_p99_x` (p99×2) sumado al OR de anomalías. |
 | 2026-06-13 | Normalización conformance: `src/schemas/normalization.py`; Bronze streaming + Silver maestros/eventos; catálogo servicio/región. |
-| 2026-06-13 | Silver/Gold re-ejecutados tras reglas de costo y normalización (40.956 válidos; Gold FinOps 12.108 filas). |
+| 2026-06-13 | Parcial 2: README CLI (`--demo-queries`), #3 rolling 30d, muestra quarantine notebook, idempotencia Cassandra §6, conteos tras corrida limpia. |
 
 ---
 
 ## Próximas entradas esperadas
 
 - [ ] Capturas de consultas AstraDB en notebook (requiere credenciales).
-- [ ] Re-ejecutar Bronze streaming tras normalización temprana si se requiere Parquet Bronze regenerado desde landing.

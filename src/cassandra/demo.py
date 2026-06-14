@@ -9,10 +9,18 @@ from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 
 from src.cassandra.client import get_cassandra_session, is_astra_configured
-from src.cassandra.schema import DEFAULT_TOP_N, TOP_SERVICES_LOOKBACK_DAYS
+from src.cassandra.schema import (
+    DEFAULT_TOP_N,
+    TICKETS_CRITICAL_LOOKBACK_DAYS,
+    TOP_SERVICES_LOOKBACK_DAYS,
+)
 from src.cassandra.selects import CqlSelect
 from src.config import CASSANDRA_KEYSPACE
-from src.jobs.gold import ORG_DAILY_USAGE_BY_SERVICE, ORG_TOP_SERVICES_BY_COST
+from src.jobs.gold import (
+    ORG_DAILY_USAGE_BY_SERVICE,
+    ORG_TOP_SERVICES_BY_COST,
+    TICKETS_BY_ORG_DATE,
+)
 
 
 @dataclass
@@ -23,8 +31,8 @@ class DemoQueryParams:
     period_start: str
     q1_start: str = "2025-07-01"
     q1_end: str = "2025-08-31"
-    q3_start: str = "2025-08-01"
-    q3_end: str = "2025-08-31"
+    q3_start: str = ""
+    q3_end: str = ""
     q3_severity: str = "high"
     q4_start: str = "2025-06-01"
     q4_end: str = "2025-08-01"
@@ -78,14 +86,39 @@ def resolve_top_services_period(
     return period_start, period_end
 
 
+def resolve_critical_tickets_period(
+    spark: SparkSession,
+    org_id: str,
+    severity: str = "high",
+) -> tuple[str, str]:
+    """Rolling window ending at max(ticket_date) for org + severity (consulta #3)."""
+    tickets_df = spark.read.parquet(TICKETS_BY_ORG_DATE).filter(
+        (F.col("org_id") == org_id) & (F.col("severity") == severity)
+    )
+    max_date = tickets_df.agg(F.max("ticket_date")).collect()[0][0]
+    if max_date is None:
+        return "2025-08-01", "2025-08-31"
+
+    period_end = str(max_date)
+    period_start = str(
+        tickets_df.agg(
+            F.date_sub(F.max("ticket_date"), TICKETS_CRITICAL_LOOKBACK_DAYS - 1)
+        ).collect()[0][0]
+    )
+    return period_start, period_end
+
+
 def build_demo_params(spark: SparkSession, org_id: str | None = None) -> DemoQueryParams:
     resolved_org = org_id or resolve_demo_org_id(spark)
     period_start, period_end = resolve_top_services_period(spark, resolved_org)
+    q3_start, q3_end = resolve_critical_tickets_period(spark, resolved_org)
     return DemoQueryParams(
         org_id=resolved_org,
         top_n=DEFAULT_TOP_N,
         period_start=period_start,
         period_end=period_end,
+        q3_start=q3_start,
+        q3_end=q3_end,
     )
 
 

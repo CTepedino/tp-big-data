@@ -75,9 +75,12 @@ python -m src.jobs.bronze_streaming
 python -m src.jobs.silver
 python -m src.jobs.gold
 
-python -m src.jobs.serving_cassandra             # foreachBatch + consultas #1–#5
-python -m src.jobs.serving_cassandra --skip-load # solo consultas
+python -m src.jobs.serving_cassandra              # DDL + carga Gold (foreachBatch)
+python -m src.jobs.serving_cassandra --skip-load  # solo DDL (sin carga)
+python -m src.jobs.serving_cassandra --demo-queries  # carga + consultas #1–#5 (CLI)
 ```
+
+Consultas CQL en notebook §7 o con `--demo-queries`. Para **corrida limpia** desde landing (normalización + dedupe): ejecutar §1→§4 del notebook con `reset_state=True` en §2, o en orden los cuatro jobs anteriores y streaming con reset.
 
 O todo junto: [`notebooks/pipeline.ipynb`](notebooks/pipeline.ipynb)
 
@@ -92,7 +95,7 @@ Usar base **Serverless (non-vector)**. Crear keyspace 'cloud_analytics'. El keys
 3. **Connect** → descargar Secure Connect Bundle + generar token **Database Administrator**
 4. Completar `.env` y correr `python -m src.jobs.serving_cassandra`
 
-El job crea las 5 tablas (`cql/00_create_tables.cql`), carga los marts Gold vía **Structured Streaming `foreachBatch`** y ejecuta las consultas #1 a #5.
+El job crea las 5 tablas (`cql/00_create_tables.cql`) y carga los marts Gold vía **Structured Streaming `foreachBatch`**. Las consultas demo (#1–#5) están en el notebook §7 o con `--demo-queries`.
 
 > **Carga (consigna):** Gold Parquet → `readStream.parquet` → `writeStream.foreachBatch` → prepared INSERT a Cassandra. Las consultas de demo usan `cassandra-driver`. Opcional en Spark 3.5.x: `src/cassandra/spark_connector.py` (Spark Cassandra Connector).
 
@@ -114,7 +117,7 @@ El job crea las 5 tablas (`cql/00_create_tables.cql`), carga los marts Gold vía
 | `Missing correct permission on cloud_analytics` | Crear keyspace en consola; token **Database Administrator** desde **Connect** |
 | `Secure connect bundle not found` | Ruta absoluta en `ASTRA_DB_SECURE_BUNDLE_PATH` |
 | `Authentication failed` | Regenerar token scoped a la base correcta |
-| Carga lenta / parece congelada | Normal en free tier (~1–2 min); usa `--skip-load` si ya cargaste |
+| Carga lenta / parece congelada | Normal en free tier (~1–2 min); usa `--skip-load` si solo necesitas DDL |
 
 ---
 
@@ -124,15 +127,18 @@ El job crea las 5 tablas (`cql/00_create_tables.cql`), carga los marts Gold vía
 |---|---:|
 | Bronze batch | customers_orgs / users / billing / resources / tickets / marketing / nps | 80 / 800 / 240 / 400 / 1000 / 1500 / 92 |
 | Bronze streaming (usage_events) | 43.200 |
-| Silver válidos / quarantine (usage_events) | 41.162 / 2.038 |
+| Silver válidos / quarantine (usage_events) | 40.956 / 2.249 |
 | Silver maestros | 7 datasets (mismos conteos que Bronze) |
-| Gold `org_daily_usage_by_service` | 12.114 |
+| Gold `org_daily_usage_by_service` | 12.108 |
+| Gold `org_top_services_by_cost` | 258 (top-5 × orgs, ventana rolling) |
 | Gold `revenue_by_org_month` | 240 |
-| Gold `cost_anomaly_mart` | 12.114 (6.416 con anomalía) |
+| Gold `cost_anomaly_mart` | 12.108 (6.351 con anomalía) |
 | Gold `tickets_by_org_date` | 984 |
 | Gold `genai_tokens_by_org_date` | 1.235 |
 | Gold `nps_by_org_date` | 92 (Gold-only, no Cassandra) |
 | Gold `marketing_touches_by_org_channel` | 1.477 (Gold-only, no Cassandra) |
+
+Conteos de referencia tras corrida limpia batch + streaming + Silver + Gold (2026-06-13).
 
 Gold-only: `cost_anomaly_mart` (consigna §4 FinOps, sin consulta CQL mínima).
 
