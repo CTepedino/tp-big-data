@@ -25,9 +25,9 @@ Documento vivo que registra las decisiones de diseño e implementación del proy
 |---|---|
 | **Layout de zonas** | `landing/` → `bronze/` → `silver/` → `gold/` + `quarantine/` + `checkpoints/` |
 | **Landing inmutable** | Sin transformaciones; fuente de verdad raw del dataset de la consigna |
-| **`DATA_ROOT`** | Por defecto `./datalake` dentro del repo; override con env `DATA_ROOT` (Colab: `/content/datalake`) |
+| **`DATA_ROOT`** | Por defecto `datalake/` en la raíz del repo; override con env `DATA_ROOT` |
 | **`source_file` relativo** | Se guarda ruta lógica bajo el datalake, no path absoluto del SO. Ej.: `landing/customers_orgs.csv`, `landing/usage_events_stream/events_part_0001.jsonl` |
-| **Motivo** | Portabilidad entre local/Colab y trazabilidad alineada al layout del lake |
+| **Motivo** | Portabilidad local con `.venv` y trazabilidad alineada al layout del lake |
 
 ---
 
@@ -205,8 +205,8 @@ Documento vivo que registra las decisiones de diseño e implementación del proy
 
 | Decisión | Detalle |
 |---|---|
-| **Runtime** | Google Colab + ejecución local con `.venv` |
-| **Módulos** | Lógica en `src/`; orquestación y evidencias en `notebooks/pipeline.ipynb` |
+| **Runtime** | Ejecución local con `.venv` |
+| **Módulos** | Lógica en `src/`; orquestación y evidencias en `pipeline.ipynb` (raíz del repo) |
 | **Spark** | `local[*]` en desarrollo; PySpark ≥ 3.5 |
 | **Dependencias** | `requirements.txt` en raíz del repo |
 

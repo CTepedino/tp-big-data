@@ -40,6 +40,7 @@ from src.schemas.silver import (
     ZSCORE_THRESHOLD,
 )
 from src.schemas.bronze_streaming import LATE_CATCHUP_MAX_SEC
+from src.jobs.bronze_streaming import read_bronze_usage_events_parquet
 
 CUSTOMERS_ORGS_BRONZE = os.path.join(BRONZE, "customers_orgs")
 USAGE_EVENTS_BRONZE = os.path.join(BRONZE, "usage_events")
@@ -316,7 +317,7 @@ def _add_cost_anomaly_flags(df: DataFrame) -> DataFrame:
 
 
 def _normalize_usage_event_dimensions(df: DataFrame) -> DataFrame:
-    """Conformance: lower/trim, catalog aliases, prefer resource maestro for service/region."""
+    """Conformance: lower/trim, catalog aliases, prefer resource master for service/region."""
     return (
         df.withColumn("event_ts", normalized_event_ts(F.col("event_ts")))
         .withColumn("service", normalized_service(F.col("service")))
@@ -385,7 +386,7 @@ def _enrich_usage_events(
 
 
 def _build_org_service_daily(valid_events_df: DataFrame) -> DataFrame:
-    """Silver feature grain: (org_id, usage_date, service) per consigna completa."""
+    """Silver feature grain: (org_id, usage_date, service) per assignment spec."""
     return (
         valid_events_df.groupBy("org_id", "usage_date", "service")
         .agg(
@@ -573,7 +574,7 @@ def _split_valid_and_quarantine(enriched_df: DataFrame) -> tuple[DataFrame, Data
 
 
 def process_usage_events_silver(spark: SparkSession) -> dict[str, Any]:
-    events_df = spark.read.parquet(USAGE_EVENTS_BRONZE)
+    events_df = read_bronze_usage_events_parquet(spark)
     customers_df = spark.read.parquet(CUSTOMERS_ORGS_SILVER)
     resources_df = spark.read.parquet(os.path.join(SILVER, "resources"))
     users_df = spark.read.parquet(os.path.join(SILVER, "users"))
@@ -739,7 +740,7 @@ def validate_silver(spark: SparkSession) -> dict[str, Any]:
         )
 
     events_silver = spark.read.parquet(USAGE_EVENTS_SILVER)
-    events_bronze = spark.read.parquet(USAGE_EVENTS_BRONZE)
+    events_bronze = read_bronze_usage_events_parquet(spark)
 
     total_silver = events_silver.count()
     distinct_ids = events_silver.select("event_id").distinct().count()

@@ -26,9 +26,9 @@ Landing → Bronze → Silver → Gold → Serving (AstraDB)
 
 ```text
 cloud-provider-analytics/
-├── cql/                    # 00 DDL, 01-02 consultas demo
+├── cql/                    # 00 DDL, 01-05 consultas demo
 ├── datalake/               # landing, bronze, silver, gold, quarantine, checkpoints
-├── notebooks/              # pipeline.ipynb
+├── pipeline.ipynb          # orquestación end-to-end
 ├── src/
 │   ├── jobs/               # modulos de cada capa y serving
 │   ├── schemas/        
@@ -50,7 +50,7 @@ cp .env.example .env   # completar credenciales Astra (se carga automáticamente
 
 | Variable | Default | Notas |
 |---|---|---|
-| `DATA_ROOT` | `./datalake` | En Colab: `/content/datalake` |
+| `DATA_ROOT` | `./datalake` (relativo al repo) | Override con env `DATA_ROOT` |
 | `CASSANDRA_KEYSPACE` | `cloud_analytics` | Crear en consola Astra |
 | `ASTRA_DB_APPLICATION_TOKEN` | — | Rol **Database Administrator** |
 | `ASTRA_DB_SECURE_BUNDLE_PATH` | — | Ruta al `.zip` |
@@ -82,7 +82,7 @@ python -m src.jobs.serving_cassandra --demo-queries  # carga + consultas #1–#5
 
 Consultas CQL en notebook §7 o con `--demo-queries`. Para **corrida limpia** desde landing (normalización + dedupe): ejecutar §1→§4 del notebook con `reset_state=True` en §2, o en orden los cuatro jobs anteriores y streaming con reset.
 
-O todo junto: [`notebooks/pipeline.ipynb`](notebooks/pipeline.ipynb)
+O todo junto: [`pipeline.ipynb`](pipeline.ipynb) (desde la raíz del repo)
 
 ---
 

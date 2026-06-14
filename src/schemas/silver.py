@@ -1,8 +1,8 @@
 """Silver layer thresholds and constants."""
 
-# Consigna: cost_usd_increment ∈ [-0.01, +∞)
+# Assignment: cost_usd_increment ∈ [-0.01, +∞)
 COST_USD_INCREMENT_MIN = -0.01
-# Consigna: flag de anomalía si supera p99 * X
+# Assignment: anomaly flag when cost exceeds p99 * X
 P99_ANOMALY_MULTIPLIER = 2.0
 
 ZSCORE_THRESHOLD = 3.0

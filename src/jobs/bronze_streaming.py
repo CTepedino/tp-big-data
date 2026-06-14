@@ -39,6 +39,66 @@ USAGE_EVENTS_BRONZE_PATH = os.path.join(BRONZE, "usage_events")
 USAGE_EVENTS_CHECKPOINT_PATH = os.path.join(CHECKPOINTS, "usage_events_bronze")
 
 
+def _streaming_num_input_rows(query: StreamingQuery) -> int:
+    total = 0
+    for progress in query.recentProgress or []:
+        if progress.get("numInputRows") is not None:
+            total += int(progress["numInputRows"])
+    return total
+
+
+def _is_reparquet_layout(bronze_path: str) -> bool:
+    if not os.path.isdir(bronze_path):
+        return False
+    return any(
+        name.startswith("usage_date=") for name in os.listdir(bronze_path)
+    )
+
+
+def _clean_stale_stream_partitions(bronze_path: str) -> int:
+    """Drop empty ingest_date dirs left by streaming reruns on reparquet layout."""
+    if not _is_reparquet_layout(bronze_path):
+        return 0
+
+    removed = 0
+    for name in os.listdir(bronze_path):
+        if not name.startswith("ingest_date="):
+            continue
+        partition_dir = os.path.join(bronze_path, name)
+        if count_parquet_files(partition_dir) == 0:
+            shutil.rmtree(partition_dir)
+            removed += 1
+    return removed
+
+
+def _prepare_bronze_for_read(bronze_path: str) -> int:
+    """Remove empty hive partitions that break spark.read.parquet schema inference."""
+    removed = _clean_stale_stream_partitions(bronze_path)
+    if not os.path.isdir(bronze_path):
+        return removed
+
+    for root, dirs, files in os.walk(bronze_path, topdown=False):
+        if root == bronze_path:
+            continue
+        if not files and not dirs:
+            os.rmdir(root)
+            removed += 1
+    return removed
+
+
+def read_bronze_usage_events_parquet(
+    spark: SparkSession,
+    bronze_path: str = USAGE_EVENTS_BRONZE_PATH,
+) -> DataFrame:
+    _prepare_bronze_for_read(bronze_path)
+    if count_parquet_files(bronze_path) == 0:
+        raise FileNotFoundError(
+            f"No Parquet files under {bronze_path}. "
+            "Run streaming Bronze with reset_state=True first."
+        )
+    return spark.read.option("mergeSchema", "true").parquet(bronze_path)
+
+
 def _streaming_relative_source_file() -> Column:
     filename = F.regexp_extract(F.input_file_name(), r"([^/]+\.jsonl)$", 1)
     return F.concat(F.lit("landing/usage_events_stream/"), filename)
@@ -57,7 +117,7 @@ def _is_replay_watermark() -> bool:
 
 
 def _ingest_ts_column() -> Column:
-    """Replay histórico: ingest alineado al evento; producción: wall-clock real."""
+    """Replay: ingest_ts aligned to event time; production: wall-clock ingest."""
     if _is_replay_watermark():
         return F.col("event_ts")
     return F.current_timestamp()
@@ -127,11 +187,22 @@ def reparquet_bronze_usage_events(
 ) -> dict[str, Any]:
     """Re-layout Bronze events by usage_date + service (reparquet) for range scans."""
     files_before = count_parquet_files(bronze_path)
-    row_count = spark.read.parquet(bronze_path).count()
+    if files_before == 0:
+        return {
+            "bronze_path": bronze_path,
+            "skipped": True,
+            "reason": "no_parquet_files",
+            "row_count": 0,
+            "parquet_files_before": 0,
+            "parquet_files_after": 0,
+            "partition_cols": ["usage_date", "service"],
+        }
+
+    bronze_df = read_bronze_usage_events_parquet(spark, bronze_path)
+    row_count = bronze_df.count()
 
     optimized = (
-        spark.read.parquet(bronze_path)
-        .withColumn("usage_date", F.to_date("event_ts"))
+        bronze_df.withColumn("usage_date", F.to_date("event_ts"))
         .repartition(SPARK_TARGET_FILES_EVENTS, "usage_date", "service")
     )
     write_partitioned_parquet(
@@ -144,6 +215,7 @@ def reparquet_bronze_usage_events(
     files_after = count_parquet_files(bronze_path)
     return {
         "bronze_path": bronze_path,
+        "skipped": False,
         "row_count": row_count,
         "parquet_files_before": files_before,
         "parquet_files_after": files_after,
@@ -175,9 +247,33 @@ def run_streaming_bronze(
     query = start_usage_events_bronze_query(spark, trigger=trigger)
     query.awaitTermination()
 
-    reparquet_stats = reparquet_bronze_usage_events(spark)
+    streaming_input_rows = _streaming_num_input_rows(query)
+    _prepare_bronze_for_read(USAGE_EVENTS_BRONZE_PATH)
 
-    bronze_df = spark.read.parquet(USAGE_EVENTS_BRONZE_PATH)
+    parquet_files = count_parquet_files(USAGE_EVENTS_BRONZE_PATH)
+    should_reparquet = (
+        parquet_files > 0
+        and (
+            reset_state
+            or streaming_input_rows > 0
+            or not _is_reparquet_layout(USAGE_EVENTS_BRONZE_PATH)
+        )
+    )
+
+    if should_reparquet:
+        reparquet_stats = reparquet_bronze_usage_events(spark)
+    else:
+        reparquet_stats = {
+            "bronze_path": USAGE_EVENTS_BRONZE_PATH,
+            "skipped": True,
+            "reason": "no_new_stream_rows",
+            "streaming_input_rows": streaming_input_rows,
+            "parquet_files_before": parquet_files,
+            "parquet_files_after": parquet_files,
+            "partition_cols": ["usage_date", "service"],
+        }
+
+    bronze_df = read_bronze_usage_events_parquet(spark)
     total_rows = bronze_df.count()
     distinct_event_ids = bronze_df.select("event_id").distinct().count()
 
@@ -195,12 +291,13 @@ def run_streaming_bronze(
         "is_unique": total_rows == distinct_event_ids,
         "late_arrivals": bronze_df.filter(F.col("is_late_arrival")).count(),
         "schema_v2_rows": bronze_df.filter(F.col("schema_version") == 2).count(),
+        "streaming_input_rows": streaming_input_rows,
         "reparquet": reparquet_stats,
     }
 
 
 def validate_bronze_streaming(spark: SparkSession) -> dict[str, Any]:
-    bronze_df = spark.read.parquet(USAGE_EVENTS_BRONZE_PATH)
+    bronze_df = read_bronze_usage_events_parquet(spark)
     total = bronze_df.count()
     distinct = bronze_df.select("event_id").distinct().count()
 

@@ -91,7 +91,7 @@ def resolve_critical_tickets_period(
     org_id: str,
     severity: str = "high",
 ) -> tuple[str, str]:
-    """Rolling window ending at max(ticket_date) for org + severity (consulta #3)."""
+    """Rolling window ending at max(ticket_date) for org + severity (query #3)."""
     tickets_df = spark.read.parquet(TICKETS_BY_ORG_DATE).filter(
         (F.col("org_id") == org_id) & (F.col("severity") == severity)
     )
@@ -157,12 +157,12 @@ def display_cql_select(session, query: CqlSelect) -> Any:
         display(df)
     except ImportError:
         print(df)
-    print(f"({len(df)} filas)")
+    print(f"({len(df)} rows)")
     return df
 
 
 def run_all_demo_queries(demo: DemoSession) -> None:
-    """Run consultas #1–#5 (notebook §7)."""
+    """Run queries #1–#5 (notebook section 7)."""
     from src.cassandra.selects import (
         critical_tickets_sla,
         daily_costs_and_requests,
@@ -173,19 +173,19 @@ def run_all_demo_queries(demo: DemoSession) -> None:
 
     p = demo.params
     queries = [
-        ("#1 — costos y requests diarios", daily_costs_and_requests(p.org_id, p.q1_start, p.q1_end)),
+        ("#1 — daily costs and requests", daily_costs_and_requests(p.org_id, p.q1_start, p.q1_end)),
         (
-            "#2 — top servicios (rolling 14d)",
+            "#2 — top services (rolling 14d)",
             top_services_by_cost(p.org_id, p.period_end, p.top_n),
         ),
         (
-            "#3 — tickets críticos + SLA",
+            "#3 — critical tickets + SLA",
             critical_tickets_sla(p.org_id, p.q3_severity, p.q3_start, p.q3_end),
         ),
-        ("#4 — revenue mensual", monthly_revenue(p.org_id, p.q4_start, p.q4_end)),
-        ("#5 — tokens GenAI", genai_tokens_daily(p.org_id, p.q5_start, p.q5_end)),
+        ("#4 — monthly revenue", monthly_revenue(p.org_id, p.q4_start, p.q4_end)),
+        ("#5 — GenAI tokens", genai_tokens_daily(p.org_id, p.q5_start, p.q5_end)),
     ]
     for title, query in queries:
-        print(f"=== Consulta {title} ===")
+        print(f"=== Query {title} ===")
         display_cql_select(demo.session, query)
         print()

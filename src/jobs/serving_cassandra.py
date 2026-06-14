@@ -224,7 +224,7 @@ def run_serving(
     setup_ddl: bool = True,
     skip_load: bool = False,
 ) -> dict[str, Any]:
-    """DDL + Gold load only. Demo queries live in src.cassandra.demo (notebook §7)."""
+    """DDL + Gold load only. Demo queries live in src.cassandra.demo (notebook section 7)."""
     session, cluster = get_cassandra_session()
     try:
         if setup_ddl:
