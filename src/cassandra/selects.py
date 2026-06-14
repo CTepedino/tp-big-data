@@ -183,8 +183,7 @@ def genai_tokens_daily(
 SELECT
     usage_date,
     total_genai_tokens,
-    estimated_cost_usd,
-    event_count
+    estimated_cost_usd
 FROM {TABLE_GENAI}
 WHERE org_id = %s
   AND usage_date >= %s
@@ -194,8 +193,7 @@ WHERE org_id = %s
 SELECT
     usage_date,
     total_genai_tokens,
-    estimated_cost_usd,
-    event_count
+    estimated_cost_usd
 FROM {TABLE_GENAI}
 WHERE org_id = '{org_id}'
   AND usage_date >= '{start.isoformat()}'

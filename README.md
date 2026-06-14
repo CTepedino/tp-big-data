@@ -33,7 +33,7 @@ cloud-provider-analytics/
 │   ├── jobs/               # modulos de cada capa y serving
 │   ├── schemas/        
 │   └── cassandra/          # cliente AstraDB, inserts, selects y demo CQL
-├── docs/                   # consigna, log de decisiones
+├── documentation/          # log de decisiones, diagrama, capturas consultas
 └── requirements.txt
 ```
 
@@ -54,10 +54,10 @@ cp .env.example .env   # completar credenciales Astra (se carga automáticamente
 | `CASSANDRA_KEYSPACE` | `cloud_analytics` | Crear en consola Astra |
 | `ASTRA_DB_APPLICATION_TOKEN` | — | Rol **Database Administrator** |
 | `ASTRA_DB_SECURE_BUNDLE_PATH` | — | Ruta al `.zip` |
-| `STREAMING_WATERMARK` | `60 days` | Replay estático; producción: `10 minutes` |
-| `LATE_DATA_THRESHOLD_SEC` | `600` | Flag `is_late_arrival` (10 min) |
-| `LATE_CATCHUP_MAX_SEC` | `1800` | Quarantine Silver si latencia > 30 min |
-| `FUTURE_EVENT_TOLERANCE_SEC` | `300` | Quarantine Silver si `event_ts` > now + 5 min |
+| `STREAMING_WATERMARK` | `60 days` | Único umbral streaming vía env; producción ref.: `10 minutes` en código |
+| `LATE_DATA_THRESHOLD_SEC` | `600` | Constante (`schemas/bronze_streaming.py`); flag `is_late_arrival` |
+| `LATE_CATCHUP_MAX_SEC` | `1800` | Constante (`schemas/bronze_streaming.py`); quarantine Silver si latencia > 30 min |
+| `FUTURE_EVENT_TOLERANCE_SEC` | `300` | Constante (`schemas/silver.py`); quarantine si `event_ts` > now + 5 min |
 | `SPARK_SHUFFLE_PARTITIONS` | `16` | Particiones de shuffle en joins/agregaciones |
 | `SPARK_TARGET_FILES_MASTER` | `1` | `coalesce` al escribir maestros (Bronze/Silver) |
 | `SPARK_TARGET_FILES_EVENTS` | `8` | `repartition` en eventos y reparquet Bronze |
@@ -120,37 +120,5 @@ El job crea las 5 tablas (`cql/00_create_tables.cql`) y carga los marts Gold ví
 | Carga lenta / parece congelada | Normal en free tier (~1–2 min); usa `--skip-load` si solo necesitas DDL |
 
 ---
-
-## Conteos de referencia
-
-| Capa | Filas |
-|---|---:|
-| Bronze batch | customers_orgs / users / billing / resources / tickets / marketing / nps | 80 / 800 / 240 / 400 / 1000 / 1500 / 92 |
-| Bronze streaming (usage_events) | 43.200 |
-| Silver válidos / quarantine (usage_events) | 40.956 / 2.249 |
-| Silver maestros | 7 datasets (mismos conteos que Bronze) |
-| Gold `org_daily_usage_by_service` | 12.108 |
-| Gold `org_top_services_by_cost` | 258 (top-5 × orgs, ventana rolling) |
-| Gold `revenue_by_org_month` | 240 |
-| Gold `cost_anomaly_mart` | 12.108 (6.351 con anomalía) |
-| Gold `tickets_by_org_date` | 984 |
-| Gold `genai_tokens_by_org_date` | 1.235 |
-| Gold `nps_by_org_date` | 92 (Gold-only, no Cassandra) |
-| Gold `marketing_touches_by_org_channel` | 1.477 (Gold-only, no Cassandra) |
-
-Conteos de referencia tras corrida limpia batch + streaming + Silver + Gold (2026-06-13).
-
-Gold-only: `cost_anomaly_mart` (consigna §4 FinOps, sin consulta CQL mínima).
-
----
-
-## Checklist MVP (parcial 2)
-
-- [x] Batch + streaming Bronze
-- [x] Silver (features, calidad, quarantine)
-- [x] Gold (7 marts: 5 servidos + 2 CRM + `cost_anomaly_mart` Gold-only)
-- [x] AstraDB (DDL, carga 5 tablas, consultas #1–#5 en código)
-- [x] Performance Spark (`coalesce` / `repartition` / reparquet documentado)
-- [ ] Capturas de consultas #1–#5 en CQL Console
 
 Más detalle de decisiones técnicas: [`documentation/LOG_DECISIONES.md`](documentation/LOG_DECISIONES.md)

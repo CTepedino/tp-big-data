@@ -1,4 +1,4 @@
--- Query #3: critical tickets (high severity) and SLA breach rate by day.
+-- Query #3: high-severity tickets and SLA breach rate by day (enunciado: tickets críticos).
 -- ticket_date range = rolling 30 days through max(ticket_date) in Gold (see demo.py).
 
 USE cloud_analytics;
@@ -14,3 +14,4 @@ WHERE org_id = 'org_rixa11dp'
   AND severity = 'high'
   AND ticket_date >= '2025-08-02'
   AND ticket_date <= '2025-08-31';
+
