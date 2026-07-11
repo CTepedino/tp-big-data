@@ -14,6 +14,12 @@ Landing → Bronze → Silver → Gold → Serving (AstraDB)
 
 ---
 
+## Autores
+
+Tomás Scheffer - 63393
+Luca Bloise - 63004
+Cristian Tepedino -  62830
+
 ## Requisitos
 
 - Python 3.11+, Java 11+
