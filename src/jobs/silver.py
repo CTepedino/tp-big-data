@@ -124,6 +124,29 @@ def _add_quarantine_metadata(df: DataFrame, error_reason: str) -> DataFrame:
     )
 
 
+# Bronze row identity for quarantine dedupe (one output row per source event).
+_QUARANTINE_ROW_KEYS = [
+    "event_id",
+    "event_ts",
+    "org_id",
+    "resource_id",
+    "service",
+    "region",
+    "metric",
+    "value",
+    "unit",
+    "cost_usd_increment",
+]
+
+
+def _dedupe_quarantine_rows(quarantine_df: DataFrame) -> DataFrame:
+    """Collapse multi-rule overlaps: same bronze row, one quarantine record."""
+    present = [c for c in _QUARANTINE_ROW_KEYS if c in quarantine_df.columns]
+    if not present or not quarantine_df.take(1):
+        return quarantine_df
+    return quarantine_df.dropDuplicates(present)
+
+
 def _normalize_columns(df: DataFrame, columns: list[str]) -> DataFrame:
     for column in columns:
         if column in df.columns:
@@ -567,6 +590,7 @@ def _split_valid_and_quarantine(enriched_df: DataFrame) -> tuple[DataFrame, Data
         quarantine_df = quarantine_parts[0]
         for part in quarantine_parts[1:]:
             quarantine_df = quarantine_df.unionByName(part, allowMissingColumns=True)
+        quarantine_df = _dedupe_quarantine_rows(quarantine_df)
     else:
         quarantine_df = enriched_df.limit(0)
 

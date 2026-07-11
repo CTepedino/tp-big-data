@@ -92,11 +92,11 @@
 | **Regla 7** | `event_ts` nulo o no parseable → quarantine | Fechas inválidas tras `to_timestamp` |
 | **Regla 8** | `service` / `region` fuera de catálogo cloud → quarantine | Solo si valor no nulo tras normalizar; defensivo ante landing ruidoso |
 | **Anomalías costo** | Z-score (`|z|>3`), MAD (`|z_mad|>3.5`), percentiles (P1/P99), **p99×X** (`X=2.0`) | `is_cost_anomaly` = OR de los 4 flags; **no** quarantine |
-| **Quarantine** | `quarantine/silver/<dataset>/` con `error_reason`, `quarantine_ts` | No bloquea el pipeline principal |
+| **Quarantine** | `quarantine/silver/<dataset>/` con `error_reason`, `quarantine_ts` | No bloquea el pipeline principal; eventos: dedupe por fila fuente tras union multi-regla |
 | **Particionado Silver** | `usage_date` (eventos), `ingest_date` (maestros) | Consultas por rango temporal en Gold |
 | **Modo escritura** | `overwrite` | Idempotencia en re-ejecución |
 
-**Conteos validados (2026-06-13):** Bronze 43.200 → Silver **40.956** válidos + Quarantine **2.249** (union multi-regla; ~2.244 `event_id` únicos en quarantine); maestros sin pérdida. Desglose quarantine eventos: ~211 costo < −0.01.
+**Conteos validados (2026-06-13):** Bronze 43.200 → Silver **40.956** válidos + Quarantine **2.244** (dedupe por fila fuente; sin solapamiento multi-regla); maestros sin pérdida. Desglose quarantine eventos: ~211 costo < −0.01.
 
 ---
 
@@ -205,7 +205,7 @@
 | **Bronze streaming** | Checkpoint `usage_events_bronze` + dedupe `event_id`; rerun sin `reset_state` no duplica eventos |
 | **Bronze streaming reparquet** | Skip si no hay filas nuevas y layout `usage_date/service` ya aplicado; limpieza de particiones `ingest_date` vacías antes de leer |
 | **Reset desarrollo** | `reset_streaming_state()` borra `bronze/usage_events/` y checkpoint streaming para corrida limpia |
-| **Silver/Gold** | `overwrite` por dataset; balance `bronze ≈ silver válido + quarantine` (union multi-regla puede inflar `quarantine_count` en stats) |
+| **Silver/Gold** | `overwrite` por dataset; balance `bronze == silver válido + quarantine` (cuarentena deduplicada por fila fuente) |
 | **Cassandra** | Upsert por PK de cada tabla vía prepared INSERT; `org_top_services_by_cost`: DELETE `(org_id, period_end)` + INSERT; checkpoints `serving_foreach_*` en foreachBatch |
 | **Notebook §6** | Re-run batch → streaming (sin reset) → Silver → Gold; validación lake + sample org en Cassandra |
 

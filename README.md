@@ -33,7 +33,7 @@ cloud-provider-analytics/
 │   ├── jobs/               # modulos de cada capa y serving
 │   ├── schemas/        
 │   └── cassandra/          # cliente AstraDB, inserts, selects y demo CQL
-├── documentation/          # log de decisiones, diagrama, capturas consultas
+├── documentation/          # log de decisiones, diagrama, diccionario, capturas consultas
 └── requirements.txt
 ```
 
@@ -121,4 +121,4 @@ El job crea las 5 tablas (`cql/00_create_tables.cql`) y carga los marts Gold ví
 
 ---
 
-Más detalle de decisiones técnicas: [`documentation/LOG_DECISIONES.md`](documentation/LOG_DECISIONES.md)
+Más detalle de decisiones técnicas: [`documentation/LOG_DECISIONES.md`](documentation/LOG_DECISIONES.md) · Diccionario de datos: [`documentation/DICCIONARIO_DATOS.md`](documentation/DICCIONARIO_DATOS.md)
